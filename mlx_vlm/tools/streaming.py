@@ -149,6 +149,13 @@ def _gemma_call(text, module):
     return [(match[1], json.dumps(arguments)[:-1])]
 
 
+def _inkling_calls(text):
+    """Inkling writes {"name": ..., "args": {...}}; its parser also takes "arguments"."""
+    return list(_json_calls(text, "name", "args")) or list(
+        _json_calls(text, "name", "arguments")
+    )
+
+
 class ToolCallDeltaState:
     def __init__(self, module, tools):
         self.module = module
@@ -165,6 +172,7 @@ class ToolCallDeltaState:
             "cohere2_moe",
             "qwen3_coder",
             "gemma4",
+            "inkling",
         ):
             return []
         self.buffer += text or ""
@@ -195,6 +203,8 @@ class ToolCallDeltaState:
                     candidates = _xml_call(body, self.tools, self.module)
                 elif name == "gemma4":
                     candidates = _gemma_call(body, self.module)
+                elif name == "inkling":
+                    candidates = _inkling_calls(body)
                 else:
                     candidates = []
             else:
@@ -224,23 +234,19 @@ class ToolCallDeltaState:
                     if not arguments.startswith(sent):
                         # JSON formatting is immaterial, but streamed bytes cannot
                         # be retracted. Recover the original complete argument value.
-                        fields = (
-                            ("tool_name", "parameters")
-                            if self.parser_name == "cohere2_moe"
-                            else ("name", "arguments")
-                        )
-                        raw_body = (
-                            body.replace("\\|", "|")
-                            if self.parser_name == "cohere2_moe"
-                            else body
-                        )
-                        raw = list(
-                            _json_calls(
-                                raw_body,
-                                *fields,
-                                require_arguments=self.parser_name != "cohere2_moe",
+                        if self.parser_name == "cohere2_moe":
+                            raw = list(
+                                _json_calls(
+                                    body.replace("\\|", "|"),
+                                    "tool_name",
+                                    "parameters",
+                                    require_arguments=False,
+                                )
                             )
-                        )
+                        elif self.parser_name == "inkling":
+                            raw = _inkling_calls(body)
+                        else:
+                            raw = list(_json_calls(body, "name", "arguments"))
                         if (
                             count <= len(raw)
                             and raw[count - 1][1].startswith(sent)
