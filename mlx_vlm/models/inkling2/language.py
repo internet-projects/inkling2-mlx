@@ -15,6 +15,7 @@
 
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -36,6 +37,21 @@ from ..inkling.language import (
 )
 from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
+
+# One-token decode without per-step copies of the key/value history (inkling2-mlx).
+# Off: the attention below runs exactly as upstream. On: a one-row step of a single
+# conversation passes the query-dependent sink to the fused attention as a per-head
+# sink (one row, so per query and per head coincide) instead of appending a zero key
+# and value to the whole history, and a full sliding ring is read in its physical
+# order with the relative-bias mask rolled to match, instead of copying the ring
+# into chronological order. Same arithmetic; the keys are summed in another order,
+# so results can differ in the last bits.
+FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in (
+    "0",
+    "off",
+    "false",
+    "no",
+)
 
 
 @mx.compile
@@ -417,11 +433,23 @@ class Attention(nn.Module):
             q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
             r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
+        fast = FAST_DECODE and length == 1 and b == 1
+        roll = 0
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
             # read in chronological order (ordinary RoPE attention does not care).
-            if isinstance(kv, RotatingKVCache):
+            if (
+                fast
+                and type(kv) is RotatingKVCache
+                and kv.keep == 0
+                and k.shape[2] == kv.max_size
+                and 0 < kv._idx < kv.offset
+            ):
+                # Physical slot p holds chronological row (p - _idx) mod S: roll the
+                # mask (heads x S) instead of copying the keys and values.
+                roll = int(kv._idx)
+            elif isinstance(kv, RotatingKVCache):
                 k, v = kv._temporal_order(k), kv._temporal_order(v)
             elif isinstance(kv, BatchRotatingKVCache) and kv.rotated:
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
@@ -440,9 +468,17 @@ class Attention(nn.Module):
         # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
+        if roll:
+            mask = mx.roll(mask, roll, axis=-1)
         sinks = self.sink_proj(x)
         if self.sharding_group is not None:
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
+        if fast:
+            # One row: the sink logit is one value per head, as the fused kernel takes it.
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.head_dim**-0.5, mask=mask, sinks=sinks.reshape(-1)
+            )
+            return self._finish(out, x, b, length)
         sinks = sinks.transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
         k = mx.concatenate(
@@ -454,6 +490,9 @@ class Attention(nn.Module):
         out = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=self.head_dim**-0.5, mask=mask
         )
+        return self._finish(out, x, b, length)
+
+    def _finish(self, out, x, b, length):
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
         out = (
             out.astype(mx.float32)
@@ -493,10 +532,21 @@ class SparseMoE(nn.Module):
             activation=SoftcappedSwiGLU(config),
         )
 
+    def _gate_f32(self):
+        # The router multiplies in FP32; keep the converted weight instead of
+        # converting it again on every call (the same values).
+        weight = self.gate_weight
+        if weight.dtype == mx.float32:
+            return weight
+        cached = self.get("_gate_weight_f32")
+        if cached is None or cached[0] is not weight:
+            self._gate_weight_f32 = (weight, weight.astype(mx.float32))
+        return self._gate_weight_f32[1]
+
     def __call__(self, x):
         indices, weights = _route(
             x,
-            self.gate_weight,
+            self._gate_f32() if FAST_DECODE else self.gate_weight,
             self.e_score_correction_bias,
             self.top_k,
             self.route_scale,
