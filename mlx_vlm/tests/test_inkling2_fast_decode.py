@@ -11,8 +11,7 @@ import copy
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.models.inkling2 import Model, ModelConfig
-from mlx_vlm.models.inkling2 import language
+from mlx_vlm.models.inkling2 import Model, ModelConfig, language
 from mlx_vlm.tests.test_models import model_case
 
 
