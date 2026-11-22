@@ -79,6 +79,12 @@ FAST_SCONV_PAIR = True
 # Plain one-row step: the MoE weighted expert combine, mlp_sconv, its residual
 # add and its next fp32 conv state in one Metal kernel.
 FAST_COMBINE_SCONV = True
+# Global layers: dynamic k/v short convolution of one conversation (no mask) as one
+# Metal kernel that also writes the fp32 context (next state, speculative window).
+FAST_DYN_CONV = True
+# Global layers: skip the log-position scaling while it is exactly 1 (all positions
+# <= log_scaling_n_floor, so log(max(p/floor, 1)) == 0).
+FAST_LOG_SKIP = True
 
 _ROW_MASK_SRC = r"""
     const int B  = rel_shape[0];
@@ -710,6 +716,110 @@ def _update_conv_cache(cache, index, state, inputs, mask):
     cache[index] = final
 
 
+_DYN_CONV_SRC = r"""
+    uint i = thread_position_in_grid.x;
+    const int L = x_shape[1];
+    const int C = x_shape[2];
+    if ((int)i >= L * C) return;
+    int c = (int)i % C;
+    int t = (int)i / C;
+    int h = c / (C / NH);
+    float xv = float(x[(size_t)t * x_strides[1] + (size_t)c * x_strides[2]]);
+    ctx[(size_t)(KM1 + t) * C + c] = xv;
+    if (t == 0) {
+        for (int s = 0; s < KM1; ++s)
+            ctx[(size_t)s * C + c] =
+                state[(size_t)s * state_strides[1] + (size_t)c * state_strides[2]];
+    }
+    float acc = 0.0f;
+    for (int lag = 0; lag < KS; ++lag) {
+        int p = t + KM1 - lag;
+        float v = p < KM1
+            ? state[(size_t)p * state_strides[1] + (size_t)c * state_strides[2]]
+            : float(x[(size_t)(p - KM1) * x_strides[1] + (size_t)c * x_strides[2]]);
+        float w = float(sw[(size_t)lag * sw_strides[0] + (size_t)c * sw_strides[1]])
+            + float(dyn[(size_t)t * dyn_strides[1]
+                        + (size_t)(h * KS + lag) * dyn_strides[2]]);
+        acc = acc + v * w;
+    }
+    out[i] = T((acc + xv) / divisor);
+"""
+_DYN_CONV_KERNEL = []
+_DYN_CONV_DIVISOR = {}
+
+
+def _dyn_conv_ok(mod, x, dyn, cache, mask):
+    """Whether the one-launch dynamic conv applies (one conversation, no mask)."""
+    k = mod.kernel_size
+    if not (
+        FAST_DECODE
+        and FAST_DYN_CONV
+        and not mod.training
+        and cache is not None
+        and mask is None
+        and k >= 2
+        and x.ndim == 3
+        and x.shape[0] == 1
+        and 1 <= x.shape[1] <= 8
+        and x.dtype in _ATTN_RES_DTYPES
+        and dyn.dtype in _ATTN_RES_DTYPES
+        and dyn.shape == (1, x.shape[1], mod.num_heads * k)
+        and x.shape[-1] % mod.num_heads == 0
+        and mod.static_weight.shape == (k, x.shape[-1])
+        and mod.static_weight.dtype in _ATTN_RES_DTYPES
+        and mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+    ):
+        return False
+    state = cache[mod.conv_idx]
+    return (
+        state is not None
+        and state.shape == (1, k - 1, x.shape[-1])
+        and state.dtype == mx.float32
+    )
+
+
+def _dyn_conv_fast(mod, x, dyn, cache):
+    """Dynamic short conv in one launch; the kernel also writes the fp32 context
+    concat(state, x), whose last rows are the next state. Same per-element
+    arithmetic as _dynamic_conv and _update_conv_cache (mask None)."""
+    if not _DYN_CONV_KERNEL:
+        _DYN_CONV_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_dynamic_conv",
+                input_names=["x", "state", "sw", "dyn", "divisor"],
+                output_names=["out", "ctx"],
+                source=_DYN_CONV_SRC,
+                ensure_row_contiguous=False,
+                compile_options={"math_mode": "safe"},
+            )
+        )
+    k = mod.kernel_size
+    divisor = _DYN_CONV_DIVISOR.get(k)
+    if divisor is None:
+        divisor = mx.array(math.sqrt(2 * k + 1), mx.float32)
+        _DYN_CONV_DIVISOR[k] = divisor
+    state = cache[mod.conv_idx]
+    length, width = x.shape[1], x.shape[2]
+    out, ctx = _DYN_CONV_KERNEL[0](
+        inputs=[x, state, mod.static_weight, dyn, divisor],
+        template=[
+            ("T", x.dtype),
+            ("NH", mod.num_heads),
+            ("KS", k),
+            ("KM1", k - 1),
+        ],
+        grid=(length * width, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape, (1, k - 1 + length, width)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+    if getattr(cache, "is_speculating", False):
+        cache.record_speculative_window(mod.conv_idx, ctx, k - 1)
+    cache[mod.conv_idx] = ctx[:, length:]
+    return out
+
+
 _SCONV_PAIR_SRC = r"""
     uint i = thread_position_in_grid.x;
     int C = kx_shape[2];
@@ -1069,6 +1179,9 @@ class DynamicShortConvolution(nn.Module):
     def __call__(self, x, dynamic_input, cache=None, mask=None):
         b, length, channels = x.shape
         k = self.kernel_size
+        dyn = self.weight_proj(dynamic_input)
+        if _dyn_conv_ok(self, x, dyn, cache, mask):
+            return _dyn_conv_fast(self, x, dyn, cache)
         xf = x.astype(mx.float32)
         inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         state = cache[self.conv_idx] if cache is not None else None
@@ -1080,15 +1193,11 @@ class DynamicShortConvolution(nn.Module):
             return _dynamic_conv(
                 x,
                 context,
-                self.weight_proj(dynamic_input),
+                dyn,
                 self.static_weight,
                 self.num_heads,
             )
-        dynamic = (
-            self.weight_proj(dynamic_input)
-            .astype(mx.float32)
-            .reshape(b, length, self.num_heads, 1, k)
-        )
+        dynamic = dyn.astype(mx.float32).reshape(b, length, self.num_heads, 1, k)
         weights = self.static_weight.T.reshape(self.num_heads, -1, k) + dynamic
         out = mx.zeros_like(xf).reshape(b, length, self.num_heads, -1)
         for lag in range(k):
@@ -1303,7 +1412,17 @@ class Attention(nn.Module):
             )
         if not self.is_sliding and cfg.log_scaling_n_floor is not None:
             offset = kv.offset if kv is not None else 0
-            if _fast_glue(x) and q.dtype == x.dtype and r.dtype == x.dtype:
+            if (
+                FAST_DECODE
+                and FAST_LOG_SKIP
+                and type(offset) is int
+                and 0 <= offset
+                and offset + length <= cfg.log_scaling_n_floor
+            ):
+                # Every position p <= floor: max(p / floor, 1) == 1, log == 0,
+                # tau == 1 exactly, so q and r are unchanged bit for bit.
+                pass
+            elif _fast_glue(x) and q.dtype == x.dtype and r.dtype == x.dtype:
                 q, r = _log_scale(
                     q,
                     r,
