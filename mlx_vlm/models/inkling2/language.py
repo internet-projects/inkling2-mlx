@@ -66,6 +66,9 @@ FAST_MESSAGES = True
 FAST_MASK = True
 # attn_sconv / mlp_sconv write the decoder residual sum directly (short rows).
 FAST_SCONV_RES = True
+# Speculative check rows of one conversation: rows folded into heads so the
+# query-dependent sink is a per-head SDPA sink (no zero K/V row appended).
+FAST_FOLD = True
 
 _ROW_MASK_SRC = r"""
     const int B  = rel_shape[0];
@@ -947,6 +950,18 @@ class Attention(nn.Module):
                 r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         fast = FAST_DECODE and length == 1 and b == 1
+        fold = (
+            FAST_DECODE
+            and FAST_FOLD
+            and not self.training
+            and b == 1
+            and 1 < length <= 8
+            and kv is not None
+            and (
+                getattr(conv, "is_speculating", False)
+                or getattr(kv, "is_speculating", False)
+            )
+        )
         roll = 0
         # A plain growing cache (global layers) stores the zero sink key/value in its
         # spare row after the new rows, so the attention reads it in place instead of
@@ -955,6 +970,7 @@ class Attention(nn.Module):
             FAST_DECODE
             and FAST_SLOT
             and not (fast and FAST_SINK)
+            and not fold
             and type(kv) is KVCache
         )
         if slot:
@@ -1018,6 +1034,18 @@ class Attention(nn.Module):
             out = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.head_dim**-0.5, mask=mask, sinks=sinks.reshape(-1)
             )
+            return self._finish(out, x, b, length)
+        if fold and mask.shape == (b, q.shape[1], length, k.shape[2]):
+            # Fold query rows into heads: folded head h*L+i is query row i of head
+            # h, which maps to the same KV head under GQA; one sink per folded head.
+            heads = q.shape[1]
+            qf = q.reshape(b, heads * length, 1, self.head_dim)
+            mf = mask.reshape(b, heads * length, 1, k.shape[2])
+            sf = sinks[0].T.reshape(-1)
+            out = mx.fast.scaled_dot_product_attention(
+                qf, k, v, scale=self.head_dim**-0.5, mask=mf, sinks=sf
+            )
+            out = out.reshape(b, heads, length, self.head_dim)
             return self._finish(out, x, b, length)
         sinks = sinks.transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
