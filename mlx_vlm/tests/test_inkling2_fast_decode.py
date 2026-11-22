@@ -100,3 +100,52 @@ def test_fast_decode_is_used_only_for_one_row(monkeypatch):
     calls.clear()
     mx.eval(lm(mx.array([[4]]), cache=cache).logits)
     assert calls and all(calls)
+
+
+def _decode_rows(model, tokens, rounds, width, fast, monkeypatch, batch=1):
+    monkeypatch.setattr(language, "FAST_DECODE", fast)
+    lm = model.language_model
+    cache = lm.make_cache()
+    rows = [lm(mx.array([tokens] * batch), cache=cache).logits]
+    nxt = tokens[-1]
+    for i in range(rounds):
+        block = []
+        for j in range(width):
+            nxt = (nxt * 7 + 3 + i + j) % lm.config.unpadded_vocab_size
+            block.append(nxt)
+        rows.append(lm(mx.array([block] * batch), cache=cache).logits)
+    mx.eval(rows)
+    return mx.concatenate(rows, axis=1)
+
+
+@pytest.mark.parametrize("loop", [False, True])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_fast_check_rows_match_stock(loop, batch, monkeypatch):
+    """Several rows at a time (a drafted check, or a batch): the global layers read
+    the sink's zero key from the cache's spare row instead of a copied history."""
+    model = _model(loop)
+    window = model.language_model.config.sliding_window_size
+    prompt = [1, 5, 9, 2, 7, 3]
+    rounds = 3 * window + 2
+    stock = _decode_rows(model, prompt, rounds, 3, False, monkeypatch, batch)
+    fast = _decode_rows(model, prompt, rounds, 3, True, monkeypatch, batch)
+    assert mx.allclose(stock, fast, atol=1e-4, rtol=1e-4).item(), float(
+        mx.abs(stock - fast).max()
+    )
+
+
+def test_fast_slot_is_used_for_global_rows(monkeypatch):
+    """The global layers' attention gets the cache buffer row, not a concatenation."""
+    model = _model(False)
+    lm = model.language_model
+    monkeypatch.setattr(language, "FAST_DECODE", True)
+    cache = lm.make_cache()
+    mx.eval(lm(mx.array([[1, 2, 3]]), cache=cache).logits)
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    plain = [c for c in iter_leaf_caches(cache) if type(c) is language.KVCache]
+    assert plain and all(c.offset == 3 for c in plain)
+    mx.eval(lm(mx.array([[4, 5]]), cache=cache).logits)
+    assert all(c.offset == 5 for c in plain)
+    for c in plain:  # the spare row after the history holds the zero sink key
+        assert mx.all(c.keys[..., c.offset, :] == 0).item()

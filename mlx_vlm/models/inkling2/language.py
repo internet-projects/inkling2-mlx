@@ -53,7 +53,7 @@ FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in
     "no",
 )
 # Parts of the fast path, for diagnosis only (each needs FAST_DECODE on).
-FAST_SINK = FAST_ROLL = FAST_GATE = True
+FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = True
 
 
 @mx.compile
@@ -437,7 +437,23 @@ class Attention(nn.Module):
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         fast = FAST_DECODE and length == 1 and b == 1
         roll = 0
-        if kv is not None:
+        # A plain growing cache (global layers) stores the zero sink key/value in its
+        # spare row after the new rows, so the attention reads it in place instead of
+        # copying the whole history to append it (prompt, check rows, batches).
+        slot = (
+            FAST_DECODE
+            and FAST_SLOT
+            and not (fast and FAST_SINK)
+            and type(kv) is KVCache
+        )
+        if slot:
+            zero_k = mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)
+            zero_v = mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)
+            k, v = kv.update_and_fetch(
+                mx.concatenate([k, zero_k], axis=2), mx.concatenate([v, zero_v], axis=2)
+            )
+            kv.trim(1)
+        elif kv is not None:
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
             # read in chronological order (ordinary RoPE attention does not care).
@@ -456,7 +472,7 @@ class Attention(nn.Module):
                 k, v = kv._temporal_order(k), kv._temporal_order(v)
             elif isinstance(kv, BatchRotatingKVCache) and kv.rotated:
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
-        size = k.shape[2]
+        size = k.shape[2] - (1 if slot else 0)
         padding = getattr(kv, "left_padding", None)
         mask = banded_additive_mask(
             r,
@@ -466,7 +482,7 @@ class Attention(nn.Module):
             self.sliding,
             self.rel_extent,
             left_padding=padding,
-            shape_ref=k,
+            shape_ref=k[..., :size, :] if slot else k,
         )
         # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
@@ -484,6 +500,11 @@ class Attention(nn.Module):
             return self._finish(out, x, b, length)
         sinks = sinks.transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
+        if slot:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.head_dim**-0.5, mask=mask
+            )
+            return self._finish(out, x, b, length)
         k = mx.concatenate(
             [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
         )
