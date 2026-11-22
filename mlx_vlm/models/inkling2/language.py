@@ -53,7 +53,26 @@ FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in
     "no",
 )
 # Parts of the fast path, for diagnosis only (each needs FAST_DECODE on).
-FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = True
+FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
+
+
+@mx.compile
+def _blend_controllers(x, message, down, gates, eps):
+    """Several MessageControllers at once: row i of the second-to-last axis uses
+    controller i (stacked weights). Same per-row arithmetic as MessageController."""
+    x = mx.broadcast_to(x, message.shape)
+    width = x.shape[-1]
+    count = message.shape[-2]
+    pair = mx.concatenate(
+        [mx.fast.rms_norm(x, None, eps), mx.fast.rms_norm(message, None, eps)],
+        axis=-1,
+    )
+    pair = pair.reshape(-1, count, 2 * width).swapaxes(0, 1).astype(down.dtype)
+    hidden = (pair @ down.swapaxes(-1, -2)).astype(mx.float32)
+    fg = mx.tanh(hidden @ gates.swapaxes(-1, -2))
+    fg = fg.swapaxes(0, 1).reshape(*message.shape[:-1], 2 * width)
+    forget, gain = fg[..., :width], fg[..., width:]
+    return (1 - forget) * x + gain * message
 
 
 @mx.compile
@@ -666,6 +685,45 @@ class DecoderLayer(nn.Module):
                 name: MessageController(config) for name in ("attn", "k", "v", "mlp")
             }
 
+    def _fast_controllers(self, x):
+        return (
+            FAST_DECODE
+            and FAST_CTRL
+            and not self.training
+            and x.shape[1] <= 8
+            and "controllers" in self
+        )
+
+    def _controller_stack(self, names):
+        # Stacked controller weights, rebuilt only when the weights change.
+        ctrls = [self.controllers[n] for n in names]
+        sources = tuple(
+            a for c in ctrls for a in (c.down_weight, c.forget_weight, c.gain_weight)
+        )
+        stacks = vars(self).get("_ctrl_stacks")
+        if stacks is None:
+            stacks = {}
+            object.__setattr__(self, "_ctrl_stacks", stacks)
+        cached = stacks.get(names)
+        if (
+            cached is None
+            or len(cached[0]) != len(sources)
+            or any(a is not b for a, b in zip(cached[0], sources))
+        ):
+            down = mx.stack([c.down_weight for c in ctrls])
+            gates = mx.stack(
+                [
+                    mx.concatenate([c.forget_weight, c.gain_weight], axis=0).astype(
+                        mx.float32
+                    )
+                    for c in ctrls
+                ]
+            )
+            mx.eval(down, gates)
+            cached = (sources, down, gates)
+            stacks[names] = cached
+        return cached[1], cached[2]
+
     def __call__(self, x, blocks, cache=None, messages=None):
         conv = cache[1] if cache is not None else None
         mask = _cache_padding_mask(conv, x.shape[1])
@@ -681,8 +739,17 @@ class DecoderLayer(nn.Module):
                 conv_mask=mask,
             )
         else:
-            parts = [mixed[..., min(i, mixed.shape[-2] - 1), :] for i in range(3)]
-            if messages is not None:
+            fast_ctrl = messages is not None and self._fast_controllers(x)
+            if fast_ctrl:
+                down, gates = self._controller_stack(("attn", "k", "v"))
+                blended = _blend_controllers(
+                    mixed, messages[..., :3, :], down, gates,
+                    self.controllers["attn"].eps,
+                )
+                parts = [blended[..., i, :] for i in range(3)]
+            else:
+                parts = [mixed[..., min(i, mixed.shape[-2] - 1), :] for i in range(3)]
+            if messages is not None and not fast_ctrl:
                 parts = [
                     self.controllers[name](part, messages[..., i, :])
                     for i, (name, part) in enumerate(zip(("attn", "k", "v"), parts))
@@ -704,7 +771,13 @@ class DecoderLayer(nn.Module):
         else:
             residual = residual + x.astype(mx.float32)
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
-        if messages is not None:
+        if messages is not None and self._fast_controllers(x):
+            down, gates = self._controller_stack(("mlp",))
+            hidden = _blend_controllers(
+                hidden[..., None, :], messages[..., 3:, :], down, gates,
+                self.controllers["mlp"].eps,
+            )[..., 0, :]
+        elif messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
         out = (residual + self.mlp_sconv(hidden, conv, mask).astype(mx.float32)).astype(
