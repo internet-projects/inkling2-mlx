@@ -60,6 +60,14 @@ FAST_GLUE = True
 FAST_ATTN_RES = True
 # One Metal kernel for the q/k/r l2 clips and the value RMS norm (short rows).
 FAST_QKV_NORM = True
+# Cross-pass messages of the looped core through the attention-residual kernel.
+FAST_MESSAGES = True
+
+
+def _message_bank(states):
+    return mx.fast.rms_norm(
+        mx.stack(states, axis=-2).astype(mx.float32), None, 1e-6
+    )
 
 _ATTN_RES_TG = 512
 _ATTN_RES_SRC = r"""
@@ -1205,6 +1213,7 @@ class TextModel(nn.Module):
         x = self.embed(inputs) if input_embeddings is None else input_embeddings
         blocks = []
         bank = None
+        bank_states = None
         if cache and len(cache) != len(self.layer_indices):
             raise ValueError(
                 "Inkling 2 requires a separate cache for every layer visit"
@@ -1216,14 +1225,29 @@ class TextModel(nn.Module):
                 else:
                     # The first block appended in the core is the prelude partial.
                     # Only completed core blocks and the last partial supply messages.
-                    states = mx.stack([*blocks[len(prelude_blocks) + 1 :], x], axis=-2)
-                    bank = mx.fast.rms_norm(states.astype(mx.float32), None, 1e-6)
+                    bank_states = [*blocks[len(prelude_blocks) + 1 :], x]
+                    bank = None
+                    if not (
+                        FAST_DECODE
+                        and FAST_MESSAGES
+                        and not self.training
+                        and x.ndim == 3
+                        and x.shape[0] * x.shape[1] <= 8
+                    ):
+                        bank = _message_bank(bank_states)
                     x, blocks = prelude, prelude_blocks.copy()
             messages = None
-            if bank is not None and index < self.loop.core_end:
+            if bank_states is not None and index < self.loop.core_end:
                 query = self.message_queries[index - self.loop.core_start]
-                scores = (query @ bank.swapaxes(-1, -2)) * x.shape[-1] ** -0.5
-                messages = mx.softmax(scores, axis=-1) @ bank
+                if bank is None:
+                    messages = _attention_residual_fast(
+                        bank_states[:-1], bank_states[-1], query, True
+                    )
+                    if messages is None:
+                        bank = _message_bank(bank_states)
+                if bank is not None:
+                    scores = (query @ bank.swapaxes(-1, -2)) * x.shape[-1] ** -0.5
+                    messages = mx.softmax(scores, axis=-1) @ bank
             # DSpark taps the partial block entering the layer, not its output.
             if visit in requested:
                 captures[visit] = x
