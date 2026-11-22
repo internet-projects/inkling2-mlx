@@ -58,6 +58,8 @@ FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
 FAST_GLUE = True
 # One Metal kernel per attention-residual mix for short (decode/check) rows.
 FAST_ATTN_RES = True
+# One Metal kernel for the q/k/r l2 clips and the value RMS norm (short rows).
+FAST_QKV_NORM = True
 
 _ATTN_RES_TG = 512
 _ATTN_RES_SRC = r"""
@@ -209,6 +211,113 @@ def _attention_residual_fast(blocks, partial, query, normalize_values):
 
 def _fast_glue(x):
     return FAST_DECODE and FAST_GLUE and x.shape[1] <= 8
+
+
+_QKV_NORM_SRC = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    uint slot = threadgroup_position_in_grid.y;
+    uint row = threadgroup_position_in_grid.z;
+    const device T* src;
+    device T* dst;
+    uint width;
+    uint head;
+    int kind;
+    if (slot < HQ) {
+        kind = 0; head = slot; width = DH;
+        src = q + ((size_t)row * HQ + head) * DH;
+        dst = q_out + ((size_t)row * HQ + head) * DH;
+    } else if (slot < HQ + HKV) {
+        kind = 1; head = slot - HQ; width = DH;
+        src = k + ((size_t)row * HKV + head) * DH;
+        dst = k_out + ((size_t)row * HKV + head) * DH;
+    } else if (slot < HQ + 2 * HKV) {
+        kind = 2; head = slot - HQ - HKV; width = DH;
+        src = v + ((size_t)row * HKV + head) * DH;
+        dst = v_out + ((size_t)row * HKV + head) * DH;
+    } else {
+        kind = 3; head = slot - HQ - 2 * HKV; width = DR;
+        src = r + ((size_t)row * HQ + head) * DR;
+        dst = r_out + ((size_t)row * HQ + head) * DR;
+    }
+    float ss = 0.0f;
+    for (uint d = lane; d < width; d += 32) {
+        float val = float(src[d]);
+        if (kind == 0) val = val * float(q_scale[head * DH + d]);
+        else if (kind == 3) val = val * float(rel_scale[head * DR + d]);
+        ss += val * val;
+    }
+    ss = simd_sum(ss);
+    float f;
+    if (kind == 2) {
+        f = metal::precise::rsqrt(ss / float(width) + params[2]);
+    } else {
+        float th = kind == 3 ? params[1] : params[0];
+        f = metal::min(th / (metal::precise::sqrt(ss) + 1e-6f), 1.0f);
+    }
+    for (uint d = lane; d < width; d += 32) {
+        float val = float(src[d]);
+        if (kind == 0) val = val * float(q_scale[head * DH + d]);
+        else if (kind == 3) val = val * float(rel_scale[head * DR + d]);
+        dst[d] = T(val * f);
+    }
+"""
+_QKV_NORM_KERNEL = []
+_QKV_NORM_PARAMS = {}
+
+
+def _qkv_norm_fast(
+    q, k, v, r, q_scale, rel_scale, n_heads, n_kv, head_dim, d_rel, qk_th, rel_th, eps
+):
+    """l2_clip(q*q_scale), l2_clip(k), rms_norm(v), l2_clip(r*rel_scale) in one
+    launch for a few rows; None when not applicable."""
+    dtype = q.dtype
+    if (
+        q.ndim != 3
+        or dtype not in _ATTN_RES_DTYPES
+        or any(a.dtype != dtype for a in (k, v, r))
+        or q_scale.dtype not in _ATTN_RES_DTYPES
+        or rel_scale.dtype not in _ATTN_RES_DTYPES
+        or q.shape[0] * q.shape[1] > 8
+        or q.shape[-1] != n_heads * head_dim
+        or k.shape != (q.shape[0], q.shape[1], n_kv * head_dim)
+        or v.shape != k.shape
+        or r.shape != (q.shape[0], q.shape[1], n_heads * d_rel)
+        or q_scale.shape != (n_heads, head_dim)
+        or rel_scale.shape != (n_heads, d_rel)
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    if not _QKV_NORM_KERNEL:
+        _QKV_NORM_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_qkv_norm",
+                input_names=["q", "k", "v", "r", "q_scale", "rel_scale", "params"],
+                output_names=["q_out", "k_out", "v_out", "r_out"],
+                source=_QKV_NORM_SRC,
+                compile_options={"math_mode": "safe"},
+            )
+        )
+    key = (float(qk_th), float(rel_th), float(eps))
+    params = _QKV_NORM_PARAMS.get(key)
+    if params is None:
+        params = mx.array(list(key), mx.float32)
+        _QKV_NORM_PARAMS[key] = params
+    rows = q.shape[0] * q.shape[1]
+    return _QKV_NORM_KERNEL[0](
+        inputs=[q, k, v, r, q_scale, rel_scale, params],
+        template=[
+            ("T", dtype),
+            ("HQ", n_heads),
+            ("HKV", n_kv),
+            ("DH", head_dim),
+            ("DR", d_rel),
+        ],
+        grid=(32, 2 * n_heads + 2 * n_kv, rows),
+        threadgroup=(32, 1, 1),
+        output_shapes=[q.shape, k.shape, v.shape, r.shape],
+        output_dtypes=[dtype, dtype, dtype, dtype],
+    )
 
 
 @mx.compile
@@ -638,26 +747,57 @@ class Attention(nn.Module):
         else:
             k = self.k_sconv(k, key_input, conv, conv_mask)
             v = self.v_sconv(v, value_input, conv, conv_mask)
-        q = l2_clip(
-            self._project(self.q_proj, x).reshape(
-                b, length, self.n_heads, self.head_dim
-            ),
-            cfg.qk_l2_clip_threshold,
-            self.q_scale,
-        )
-        k = l2_clip(
-            k.reshape(b, length, self.n_kv, self.head_dim), cfg.qk_l2_clip_threshold
-        )
-        v = v.reshape(b, length, self.n_kv, self.head_dim)
-        if cfg.use_value_norm_no_gamma:
-            v = mx.fast.rms_norm(v.astype(mx.float32), None, cfg.rms_norm_eps).astype(
-                x.dtype
+        qp = self._project(self.q_proj, x)
+        rp = self._project(self.r_proj, x)
+        post = None
+        if (
+            FAST_DECODE
+            and FAST_QKV_NORM
+            and not self.training
+            and cfg.use_value_norm_no_gamma
+            and qp.dtype == x.dtype
+        ):
+            post = _qkv_norm_fast(
+                qp,
+                k,
+                v,
+                rp,
+                self.q_scale,
+                self.rel_scale,
+                self.n_heads,
+                self.n_kv,
+                self.head_dim,
+                cfg.d_rel,
+                cfg.qk_l2_clip_threshold,
+                cfg.rel_l2_clip_threshold,
+                cfg.rms_norm_eps,
             )
-        r = l2_clip(
-            self._project(self.r_proj, x).reshape(b, length, self.n_heads, cfg.d_rel),
-            cfg.rel_l2_clip_threshold,
-            self.rel_scale,
-        )
+        if post is not None:
+            q, k, v, r = post
+            q = q.reshape(b, length, self.n_heads, self.head_dim)
+            k = k.reshape(b, length, self.n_kv, self.head_dim)
+            v = v.reshape(b, length, self.n_kv, self.head_dim)
+            r = r.reshape(b, length, self.n_heads, cfg.d_rel)
+        else:
+            q = l2_clip(
+                qp.reshape(b, length, self.n_heads, self.head_dim),
+                cfg.qk_l2_clip_threshold,
+                self.q_scale,
+            )
+            k = l2_clip(
+                k.reshape(b, length, self.n_kv, self.head_dim),
+                cfg.qk_l2_clip_threshold,
+            )
+            v = v.reshape(b, length, self.n_kv, self.head_dim)
+            if cfg.use_value_norm_no_gamma:
+                v = mx.fast.rms_norm(
+                    v.astype(mx.float32), None, cfg.rms_norm_eps
+                ).astype(x.dtype)
+            r = l2_clip(
+                rp.reshape(b, length, self.n_heads, cfg.d_rel),
+                cfg.rel_l2_clip_threshold,
+                self.rel_scale,
+            )
         if not self.is_sliding and cfg.log_scaling_n_floor is not None:
             offset = kv.offset if kv is not None else 0
             if _fast_glue(x) and q.dtype == x.dtype and r.dtype == x.dtype:
