@@ -56,6 +56,155 @@ FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in
 FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
 # Compiled elementwise glue (output gate, residual adds, dynamic conv, log scaling).
 FAST_GLUE = True
+# One Metal kernel per attention-residual mix for short (decode/check) rows.
+FAST_ATTN_RES = True
+
+_ATTN_RES_TG = 512
+_ATTN_RES_SRC = r"""
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    constexpr uint NS = TG / 32;
+    constexpr uint NB = @NB@;
+    threadgroup float red[NS * NB * NQ];
+    threadgroup float tot[NB * NQ];
+    size_t base = (size_t)row * D;
+    float ss[NB];
+    for (uint k = 0; k < NB; ++k) ss[k] = 0.0f;
+    for (uint d = tid; d < D; d += TG) {
+@SUMSQ@
+    }
+    for (uint k = 0; k < NB; ++k) {
+        float s = simd_sum(ss[k]);
+        if (lane == 0) red[sg * NB + k] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < NB) {
+        float s = 0.0f;
+        for (uint g = 0; g < NS; ++g) s += red[g * NB + tid];
+        tot[tid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv[NB];
+    for (uint k = 0; k < NB; ++k)
+        inv[k] = metal::precise::rsqrt(tot[k] / (float)D + 1e-6f);
+    float dots[NB * NQ];
+    for (uint j = 0; j < NB * NQ; ++j) dots[j] = 0.0f;
+    for (uint d = tid; d < D; d += TG) {
+        float qv[NQ];
+        for (uint q = 0; q < NQ; ++q) qv[q] = float(query[q * D + d]);
+@DOTS@
+    }
+    for (uint j = 0; j < NB * NQ; ++j) {
+        float s = simd_sum(dots[j]);
+        if (lane == 0) red[sg * NB * NQ + j] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < NB * NQ) {
+        float s = 0.0f;
+        for (uint g = 0; g < NS; ++g) s += red[g * NB * NQ + tid];
+        tot[tid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = metal::precise::rsqrt((float)D);
+    float wts[NB * NQ];
+    for (uint q = 0; q < NQ; ++q) {
+        float m = -INFINITY;
+        for (uint k = 0; k < NB; ++k) {
+            wts[k * NQ + q] = tot[k * NQ + q] * scale;
+            m = metal::max(m, wts[k * NQ + q]);
+        }
+        float sum = 0.0f;
+        for (uint k = 0; k < NB; ++k) {
+            wts[k * NQ + q] = metal::precise::exp(wts[k * NQ + q] - m);
+            sum += wts[k * NQ + q];
+        }
+        for (uint k = 0; k < NB; ++k) wts[k * NQ + q] = wts[k * NQ + q] / sum;
+    }
+    for (uint d = tid; d < D; d += TG) {
+        float vals[NB];
+@VALUES@
+        for (uint q = 0; q < NQ; ++q) {
+            float o = 0.0f;
+            for (uint k = 0; k < NB; ++k) o += wts[k * NQ + q] * vals[k];
+            out[((size_t)row * NQ + q) * D + d] = o;
+        }
+    }
+"""
+_ATTN_RES_KERNELS = {}
+
+
+def _attn_res_kernel(count):
+    kernel = _ATTN_RES_KERNELS.get(count)
+    if kernel is None:
+        sumsq = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]); ss[{k}] += v * v; }}"
+            for k in range(count)
+        )
+        dots = "\n".join(
+            f"        {{ float key = float(x{k}[base + d]) * inv[{k}];"
+            f" for (uint q = 0; q < NQ; ++q) dots[{k} * NQ + q] += key * qv[q]; }}"
+            for k in range(count)
+        )
+        values = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]);"
+            f" vals[{k}] = NORMALIZE ? v * inv[{k}] : v; }}"
+            for k in range(count)
+        )
+        source = (
+            _ATTN_RES_SRC.replace("@NB@", str(count))
+            .replace("@SUMSQ@", sumsq)
+            .replace("@DOTS@", dots)
+            .replace("@VALUES@", values)
+        )
+        kernel = mx.fast.metal_kernel(
+            name=f"inkling2_attention_residual_{count}",
+            input_names=[*(f"x{k}" for k in range(count)), "query"],
+            output_names=["out"],
+            source=source,
+        )
+        _ATTN_RES_KERNELS[count] = kernel
+    return kernel
+
+
+_ATTN_RES_DTYPES = (mx.float32, mx.bfloat16, mx.float16)
+
+
+def _attention_residual_fast(blocks, partial, query, normalize_values):
+    """Fused attention residual for a few rows; None when not applicable."""
+    inputs = [*blocks, partial]
+    shape = partial.shape
+    if (
+        len(shape) != 3
+        or shape[0] * shape[1] > 8
+        or len(inputs) > 8
+        or query.ndim not in (1, 2)
+        or query.shape[-1] != shape[-1]
+        or query.dtype not in _ATTN_RES_DTYPES
+        or any(a.shape != shape or a.dtype not in _ATTN_RES_DTYPES for a in inputs)
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    width = shape[-1]
+    nq = 1 if query.ndim == 1 else query.shape[0]
+    if nq < 1 or nq > 4:
+        return None
+    rows = shape[0] * shape[1]
+    return _attn_res_kernel(len(inputs))(
+        inputs=[*inputs, query],
+        template=[
+            ("TG", _ATTN_RES_TG),
+            ("NQ", nq),
+            ("D", width),
+            ("NORMALIZE", bool(normalize_values)),
+        ],
+        grid=(_ATTN_RES_TG, rows, 1),
+        threadgroup=(_ATTN_RES_TG, 1, 1),
+        output_shapes=[(shape[0], shape[1], nq, width)],
+        output_dtypes=[mx.float32],
+    )[0]
 
 
 def _fast_glue(x):
@@ -701,6 +850,12 @@ class AttentionResidual(nn.Module):
         self.normalize_values = config.attn_res_normalize_values
 
     def __call__(self, blocks, partial):
+        if FAST_DECODE and FAST_ATTN_RES and not self.training:
+            out = _attention_residual_fast(
+                blocks, partial, self.query, self.normalize_values
+            )
+            if out is not None:
+                return out
         return _attention_residual(
             mx.stack([*blocks, partial], axis=-2), self.query, self.normalize_values
         )
