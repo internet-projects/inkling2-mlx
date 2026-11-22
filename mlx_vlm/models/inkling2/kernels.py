@@ -53,3 +53,76 @@ def short_convolution(state, weight, x, mask, width):
         output_shapes=[x.shape],
         output_dtypes=[x.dtype],
     )[0]
+
+
+@lru_cache(maxsize=1)
+def _short_convolution_residual():
+    return mx.fast.metal_kernel(
+        name="inkling2_short_convolution_residual",
+        input_names=["state", "weight", "x", "mask", "divisor", "res"],
+        output_names=["out"],
+        ensure_row_contiguous=False,
+        compile_options={"math_mode": "safe"},
+        source=r"""
+        uint i = thread_position_in_grid.x;
+        int B = x_shape[0], L = x_shape[1], C = x_shape[2];
+        if (i >= B * L * C) return;
+        int c = i % C, t = (i / C) % L, b = i / (C * L);
+        float value = 0;
+        for (int j = 0; j < W; ++j) {
+            int p = t + j - W + 1;
+            float xv = p < 0
+                ? float(state[b * state_strides[0] + (p + W - 1) * state_strides[1]
+                              + c * state_strides[2]])
+                : ((HAS_MASK && !mask[b * mask_strides[0] + p * mask_strides[1]])
+                    ? 0.0f
+                    : float(x[b * x_strides[0] + p * x_strides[1] + c * x_strides[2]]));
+            float w = weight[c * weight_strides[0] + j * weight_strides[1]];
+            value = value + xv * w;
+        }
+        T y = T((value + float(x[b * x_strides[0] + t * x_strides[1]
+                                 + c * x_strides[2]])) / divisor);
+        float rv = HAS_RES
+            ? float(res[b * res_strides[0] + t * res_strides[1] + c * res_strides[2]])
+            : 0.0f;
+        if (MODE == 2) {
+            out[i] = O(rv + float(y));
+        } else {
+            out[i] = O(HAS_RES ? float(y) + rv : float(y));
+        }
+        """,
+    )
+
+
+_RESIDUAL_CONSTANTS = {}
+
+
+def short_convolution_residual(state, weight, x, mask, width, residual, mode):
+    """short_convolution's output rounded to x.dtype, then the decoder glue:
+    mode 1 -> fp32 (conv + residual, or conv alone); mode 2 -> x.dtype
+    (residual + conv). Constants are cached instead of rebuilt per call."""
+    consts = _RESIDUAL_CONSTANTS.get(width)
+    if consts is None:
+        consts = (
+            mx.array(math.sqrt(width + 1), mx.float32),
+            mx.array([[False]]),
+        )
+        _RESIDUAL_CONSTANTS[width] = consts
+    divisor, dummy = consts
+    res = x if residual is None else residual
+    out_dtype = mx.float32 if mode == 1 else x.dtype
+    return _short_convolution_residual()(
+        inputs=[state, weight, x, mask if mask is not None else dummy, divisor, res],
+        template=[
+            ("T", x.dtype),
+            ("O", out_dtype),
+            ("W", width),
+            ("HAS_MASK", mask is not None),
+            ("HAS_RES", residual is not None),
+            ("MODE", int(mode)),
+        ],
+        grid=(x.size, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[out_dtype],
+    )[0]

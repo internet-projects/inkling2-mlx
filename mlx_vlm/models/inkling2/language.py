@@ -62,6 +62,94 @@ FAST_ATTN_RES = True
 FAST_QKV_NORM = True
 # Cross-pass messages of the looped core through the attention-residual kernel.
 FAST_MESSAGES = True
+# Banded relative mask for short rows: 1-D threadgroups, sliding-ring roll folded in.
+FAST_MASK = True
+# attn_sconv / mlp_sconv write the decoder residual sum directly (short rows).
+FAST_SCONV_RES = True
+
+_ROW_MASK_SRC = r"""
+    const int B  = rel_shape[0];
+    const int LQ = rel_shape[1];
+    const int H  = rel_shape[2];
+    const int S  = kshape_shape[2];
+    uint p  = thread_position_in_grid.x;
+    uint i  = thread_position_in_grid.y;
+    uint bh = thread_position_in_grid.z;
+    if ((int)i >= LQ || (int)p >= S || (int)bh >= B * H) return;
+    uint b = bh / H, h = bh % H;
+    int j = (int)p - shift[0];
+    if (j < 0) j += S;
+    int dist = ((int)i + (S - LQ)) - j;
+    T val;
+    if (dist < 0) {
+        val = (T)(-1e30f);
+    } else if (SLIDING > 0 && dist >= (int)SLIDING) {
+        val = (T)(-1e30f);
+    } else if (dist < (int)REL_EXTENT) {
+        float acc = 0.0f;
+        const size_t rbase = (size_t)b * rel_strides[0]
+            + (size_t)i * rel_strides[1] + (size_t)h * rel_strides[2];
+        for (uint d = 0; d < D_REL; ++d)
+            acc += (float)rel[rbase + (size_t)d * rel_strides[3]]
+                 * (float)proj[(size_t)d * proj_strides[0]
+                               + (size_t)dist * proj_strides[1]];
+        val = (T)acc;
+    } else {
+        val = (T)0;
+    }
+    out[(((size_t)b * H + h) * LQ + i) * S + p] = val;
+"""
+_ROW_MASK_KERNEL = []
+_ROW_MASK_SHIFTS = {}
+
+
+def _row_mask_fast(rel, proj, kref, size, sliding, rel_extent, roll):
+    """Banded additive mask [B, H, LQ, S] for a few query rows, with physical
+    slot p holding chronological key (p - roll) mod S. Same per-element
+    arithmetic as the v2 mask kernel; None when not applicable."""
+    if (
+        rel.ndim != 4
+        or rel.shape[1] > 8
+        or kref.ndim < 3
+        or kref.shape[2] != size
+        or size < 1
+        or rel.dtype not in _ATTN_RES_DTYPES
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    if not _ROW_MASK_KERNEL:
+        _ROW_MASK_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_banded_mask_rows",
+                input_names=["rel", "proj", "kshape", "shift"],
+                output_names=["out"],
+                source=_ROW_MASK_SRC,
+                ensure_row_contiguous=False,
+            )
+        )
+    roll = int(roll) % size
+    shift = _ROW_MASK_SHIFTS.get(roll)
+    if shift is None:
+        if len(_ROW_MASK_SHIFTS) > 8192:
+            _ROW_MASK_SHIFTS.clear()
+        shift = mx.array([roll], mx.int32)
+        _ROW_MASK_SHIFTS[roll] = shift
+    b, lq, h, d_rel = rel.shape
+    tg = min(256, size)
+    return _ROW_MASK_KERNEL[0](
+        inputs=[rel, proj, kref, shift],
+        template=[
+            ("T", rel.dtype),
+            ("D_REL", d_rel),
+            ("REL_EXTENT", int(rel_extent)),
+            ("SLIDING", int(sliding)),
+        ],
+        grid=(((size + tg - 1) // tg) * tg, lq, b * h),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(b, h, lq, size)],
+        output_dtypes=[rel.dtype],
+    )[0]
 
 
 def _message_bank(states):
@@ -530,6 +618,41 @@ def _update_conv_cache(cache, index, state, inputs, mask):
 
 
 class ShortConvolution(InklingShortConvolution):
+    def fused(self, x, cache, mask, residual, mode):
+        """Decode kernel with the decoder's residual add folded in; None when the
+        stock kernel path would not run. mode 1: fp32 out = conv (+ residual);
+        mode 2: model-dtype out = residual + conv. Same roundings as the glue."""
+        if not (
+            FAST_DECODE
+            and FAST_SCONV_RES
+            and not self.training
+            and x.ndim == 3
+            and x.dtype == mx.bfloat16
+            and self.kernel_size == 4
+            and x.shape[0] <= 4
+            and x.shape[1] <= 8
+            and x.shape[-1] % 128 == 0
+            and (
+                residual is None
+                or (
+                    residual.shape == x.shape
+                    and residual.dtype in (mx.float32, mx.bfloat16, mx.float16)
+                )
+            )
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            return None
+        from .kernels import short_convolution_residual
+
+        state = cache[self.conv_idx] if cache is not None else None
+        if state is None:
+            state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]))
+        _update_conv_cache(cache, self.conv_idx, state, x, mask)
+        return short_convolution_residual(
+            state, self.conv.weight, x, mask, self.kernel_size, residual, mode
+        )
+
     def __call__(self, x, cache=None, mask=None):
         # Keep the convolution, residual, and scaling in FP32. The checkpoint
         # stores BF16 taps, but rounding the convolution before adding the
@@ -863,16 +986,26 @@ class Attention(nn.Module):
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
         size = k.shape[2] - (1 if slot else 0)
         padding = getattr(kv, "left_padding", None)
-        mask = banded_additive_mask(
-            r,
-            self.rel_proj.astype(x.dtype),
-            size - length,
-            size,
-            self.sliding,
-            self.rel_extent,
-            left_padding=padding,
-            shape_ref=k[..., :size, :] if slot else k,
-        )
+        kref = k[..., :size, :] if slot else k
+        proj = self.rel_proj.astype(x.dtype)
+        mask = None
+        if FAST_DECODE and FAST_MASK and padding is None and not self.training:
+            mask = _row_mask_fast(
+                r, proj, kref, size, self.sliding, self.rel_extent, roll
+            )
+            if mask is not None:
+                roll = 0
+        if mask is None:
+            mask = banded_additive_mask(
+                r,
+                proj,
+                size - length,
+                size,
+                self.sliding,
+                self.rel_extent,
+                left_padding=padding,
+                shape_ref=kref,
+            )
         # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
@@ -1145,14 +1278,21 @@ class DecoderLayer(nn.Module):
             parts = [norm(part).astype(x.dtype) for norm, part in zip(norms, parts)]
             attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
         glue = _fast_glue(x) and not self.training
-        attn_out = self.attn_sconv(attn, conv, mask)
+        residual = None
+        if glue:
+            residual = self.attn_sconv.fused(
+                attn, conv, mask, None if self.is_block_boundary else x, 1
+            )
+        if residual is None:
+            attn_out = self.attn_sconv(attn, conv, mask)
+            if self.is_block_boundary:
+                residual = attn_out.astype(mx.float32)
+            elif glue:
+                residual = _sum_f32(attn_out, x)
+            else:
+                residual = attn_out.astype(mx.float32) + x.astype(mx.float32)
         if self.is_block_boundary:
-            residual = attn_out.astype(mx.float32)
             blocks.append(x)
-        elif glue:
-            residual = _sum_f32(attn_out, x)
-        else:
-            residual = attn_out.astype(mx.float32) + x.astype(mx.float32)
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
         if messages is not None and self._fast_controllers(x):
             down, gates = self._controller_stack(("mlp",))
@@ -1163,11 +1303,15 @@ class DecoderLayer(nn.Module):
         elif messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
-        mlp_out = self.mlp_sconv(hidden, conv, mask)
-        if glue:
-            out = _sum_f32_as(residual, mlp_out, x.dtype)
-        else:
-            out = (residual + mlp_out.astype(mx.float32)).astype(x.dtype)
+        out = None
+        if glue and hidden.dtype == x.dtype and residual.dtype == mx.float32:
+            out = self.mlp_sconv.fused(hidden, conv, mask, residual, 2)
+        if out is None:
+            mlp_out = self.mlp_sconv(hidden, conv, mask)
+            if glue:
+                out = _sum_f32_as(residual, mlp_out, x.dtype)
+            else:
+                out = (residual + mlp_out.astype(mx.float32)).astype(x.dtype)
         if conv is not None:
             conv.advance(x.shape[1])
         return out
