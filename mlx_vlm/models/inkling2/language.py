@@ -52,6 +52,8 @@ FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in
     "false",
     "no",
 )
+# Parts of the fast path, for diagnosis only (each needs FAST_DECODE on).
+FAST_SINK = FAST_ROLL = FAST_GATE = True
 
 
 @mx.compile
@@ -441,6 +443,7 @@ class Attention(nn.Module):
             # read in chronological order (ordinary RoPE attention does not care).
             if (
                 fast
+                and FAST_ROLL
                 and type(kv) is RotatingKVCache
                 and kv.keep == 0
                 and k.shape[2] == kv.max_size
@@ -473,7 +476,7 @@ class Attention(nn.Module):
         sinks = self.sink_proj(x)
         if self.sharding_group is not None:
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
-        if fast:
+        if fast and FAST_SINK:
             # One row: the sink logit is one value per head, as the fused kernel takes it.
             out = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.head_dim**-0.5, mask=mask, sinks=sinks.reshape(-1)
@@ -546,7 +549,7 @@ class SparseMoE(nn.Module):
     def __call__(self, x):
         indices, weights = _route(
             x,
-            self._gate_f32() if FAST_DECODE else self.gate_weight,
+            self._gate_f32() if FAST_DECODE and FAST_GATE else self.gate_weight,
             self.e_score_correction_bias,
             self.top_k,
             self.route_scale,
