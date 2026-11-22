@@ -21,10 +21,10 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.1" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.2" torch torchvision
 ```
 
-This installs `mlx-vlm` version `0.8.0+inkling2mini.3`. Without the tool-call parser, stock MLX-VLM from main works too:
+This installs `mlx-vlm` version `0.8.0+inkling2mini.4`. Without the tool-call parser, stock MLX-VLM from main works too:
 `pip install "git+https://github.com/Neywa-Labs/mlx-vlm" torch torchvision`. PyTorch and torchvision are only used on the CPU by the image
 processor.
 
