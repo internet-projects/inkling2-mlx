@@ -58,6 +58,8 @@ FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
 FAST_GLUE = True
 # One Metal kernel per attention-residual mix for short (decode/check) rows.
 FAST_ATTN_RES = True
+# Attention-residual kernel: sum of squares and query dots in one pass.
+FAST_ATTN_RES_ONEPASS = True
 # One Metal kernel for the q/k/r l2 clips and the value RMS norm (short rows).
 FAST_QKV_NORM = True
 # Cross-pass messages of the looped core through the attention-residual kernel.
@@ -237,11 +239,92 @@ _ATTN_RES_SRC = r"""
         }
     }
 """
+_ATTN_RES_ONEPASS_SRC = r"""
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    constexpr uint NS = TG / 32;
+    constexpr uint NB = @NB@;
+    constexpr uint NV = NB + NB * NQ;
+    threadgroup float red[NS * NV];
+    threadgroup float tot[NV];
+    size_t base = (size_t)row * D;
+    float acc[NV];
+    for (uint j = 0; j < NV; ++j) acc[j] = 0.0f;
+    for (uint d = tid; d < D; d += TG) {
+        float qv[NQ];
+        for (uint q = 0; q < NQ; ++q) qv[q] = float(query[q * D + d]);
+@FUSED@
+    }
+    for (uint j = 0; j < NV; ++j) {
+        float s = simd_sum(acc[j]);
+        if (lane == 0) red[sg * NV + j] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < NV) {
+        float s = 0.0f;
+        for (uint g = 0; g < NS; ++g) s += red[g * NV + tid];
+        tot[tid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv[NB];
+    for (uint k = 0; k < NB; ++k)
+        inv[k] = metal::precise::rsqrt(tot[k] / (float)D + 1e-6f);
+    float scale = metal::precise::rsqrt((float)D);
+    float wts[NB * NQ];
+    for (uint q = 0; q < NQ; ++q) {
+        float m = -INFINITY;
+        for (uint k = 0; k < NB; ++k) {
+            wts[k * NQ + q] = (tot[NB + k * NQ + q] * inv[k]) * scale;
+            m = metal::max(m, wts[k * NQ + q]);
+        }
+        float sum = 0.0f;
+        for (uint k = 0; k < NB; ++k) {
+            wts[k * NQ + q] = metal::precise::exp(wts[k * NQ + q] - m);
+            sum += wts[k * NQ + q];
+        }
+        for (uint k = 0; k < NB; ++k) wts[k * NQ + q] = wts[k * NQ + q] / sum;
+    }
+    for (uint d = tid; d < D; d += TG) {
+        float vals[NB];
+@VALUES@
+        for (uint q = 0; q < NQ; ++q) {
+            float o = 0.0f;
+            for (uint k = 0; k < NB; ++k) o += wts[k * NQ + q] * vals[k];
+            out[((size_t)row * NQ + q) * D + d] = o;
+        }
+    }
+"""
 _ATTN_RES_KERNELS = {}
 
 
 def _attn_res_kernel(count):
-    kernel = _ATTN_RES_KERNELS.get(count)
+    onepass = bool(FAST_ATTN_RES_ONEPASS)
+    kernel = _ATTN_RES_KERNELS.get((count, onepass))
+    if kernel is None and onepass:
+        fused = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]); acc[{k}] += v * v;"
+            f" for (uint q = 0; q < NQ; ++q) acc[NB + {k} * NQ + q] += v * qv[q]; }}"
+            for k in range(count)
+        )
+        values = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]);"
+            f" vals[{k}] = NORMALIZE ? v * inv[{k}] : v; }}"
+            for k in range(count)
+        )
+        source = (
+            _ATTN_RES_ONEPASS_SRC.replace("@NB@", str(count))
+            .replace("@FUSED@", fused)
+            .replace("@VALUES@", values)
+        )
+        kernel = mx.fast.metal_kernel(
+            name=f"inkling2_attention_residual_onepass_{count}",
+            input_names=[*(f"x{k}" for k in range(count)), "query"],
+            output_names=["out"],
+            source=source,
+        )
+        _ATTN_RES_KERNELS[(count, onepass)] = kernel
     if kernel is None:
         sumsq = "\n".join(
             f"        {{ float v = float(x{k}[base + d]); ss[{k}] += v * v; }}"
@@ -269,7 +352,7 @@ def _attn_res_kernel(count):
             output_names=["out"],
             source=source,
         )
-        _ATTN_RES_KERNELS[count] = kernel
+        _ATTN_RES_KERNELS[(count, onepass)] = kernel
     return kernel
 
 
