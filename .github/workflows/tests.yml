@@ -141,6 +141,7 @@ jobs:
               tests/test_muse_spark_kernels.py
               tests/test_oxr.py
               tests/test_position_embedding_resize.py
+              tests/test_inkling_channels.py
               tests/test_inkling_tool_parser.py
               tests/test_processors.py
               tests/test_speculative.py

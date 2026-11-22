@@ -13,6 +13,11 @@ from transformers.utils.chat_parsing.response_templates import load_response_tem
 
 from ..prompt_utils import _normalize_tool_message
 from ..tools import process_tool_calls
+from .inkling_channels import (
+    InklingChannelRewriter,
+    has_inkling_markers,
+    is_inkling_tokenizer,
+)
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -224,6 +229,17 @@ class ResponseTemplateStreamState:
         )
 
 
+class InklingThinkingStreamState(ThinkingStreamState):
+    """ThinkingStreamState for raw Inkling output (message channels rewritten first)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._inkling = InklingChannelRewriter(keep_tool_calls=False)
+
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
+        return super().feed(self._inkling.feed(text, final=last), last=last)
+
+
 def _response_template_tokenizer(processor):
     if processor is None:
         return None
@@ -261,6 +277,14 @@ def make_response_stream_state(
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
+    base = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if base is not None and is_inkling_tokenizer(base):
+        # Without a usable response template, read Inkling's message channels here.
+        return InklingThinkingStreamState(
+            enable_thinking,
+            thinking_start_token,
+            thinking_end_token,
+        )
     return ThinkingStreamState(
         enable_thinking,
         thinking_start_token,
@@ -515,6 +539,9 @@ def _split_thinking(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
 
+    if has_inkling_markers(text):
+        text = InklingChannelRewriter().feed(text, final=True)
+
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
     ):
@@ -557,6 +584,8 @@ def parse_assistant_tool_calls(
     Response-template parsers may consume tool regions, so split reasoning with
     the delimiter state instead. Examples inside reasoning are never tool calls.
     """
+    if has_inkling_markers(text):
+        text = InklingChannelRewriter().feed(text, final=True)
     content = (
         ThinkingStreamState(
             starts_in_thinking, thinking_start_token, thinking_end_token
