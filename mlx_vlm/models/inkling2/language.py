@@ -54,6 +54,62 @@ FAST_DECODE = os.environ.get("INKLING2_FAST_DECODE", "1").strip().lower() not in
 )
 # Parts of the fast path, for diagnosis only (each needs FAST_DECODE on).
 FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
+# Compiled elementwise glue (output gate, residual adds, dynamic conv, log scaling).
+FAST_GLUE = True
+
+
+def _fast_glue(x):
+    return FAST_DECODE and FAST_GLUE and x.shape[1] <= 8
+
+
+@mx.compile
+def _output_gate(out, gate):
+    return (
+        out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
+    ).astype(out.dtype)
+
+
+@mx.compile
+def _sum_f32(a, b):
+    return a.astype(mx.float32) + b.astype(mx.float32)
+
+
+_SUM_AS = {}
+
+
+def _sum_f32_as(a, b, dtype):
+    fn = _SUM_AS.get(dtype)
+    if fn is None:
+        fn = mx.compile(
+            lambda p, q: (p.astype(mx.float32) + q.astype(mx.float32)).astype(dtype)
+        )
+        _SUM_AS[dtype] = fn
+    return fn(a, b)
+
+
+@mx.compile
+def _log_scale(q, r, offset, alpha, floor):
+    positions = mx.arange(q.shape[1]) + offset[..., None] + 1
+    tau = 1 + alpha * mx.log(mx.maximum(positions / floor, 1))
+    tau = tau[..., None, None]
+    return (
+        (q.astype(mx.float32) * tau).astype(q.dtype),
+        (r.astype(mx.float32) * tau).astype(r.dtype),
+    )
+
+
+@mx.compile
+def _dynamic_conv(x, context, dynamic, static_weight, num_heads):
+    b, length, channels = x.shape
+    k = static_weight.shape[0]
+    xf = x.astype(mx.float32)
+    dynamic = dynamic.astype(mx.float32).reshape(b, length, num_heads, 1, k)
+    weights = static_weight.T.reshape(num_heads, -1, k) + dynamic
+    out = mx.zeros_like(xf).reshape(b, length, num_heads, -1)
+    for lag in range(k):
+        values = context[:, k - 1 - lag : k - 1 - lag + length].reshape(out.shape)
+        out = out + values * weights[..., lag]
+    return ((out.reshape(x.shape) + xf) / math.sqrt(2 * k + 1)).astype(x.dtype)
 
 
 @mx.compile
@@ -263,6 +319,14 @@ class DynamicShortConvolution(nn.Module):
             state = mx.zeros((b, k - 1, channels), mx.float32)
         context = mx.concatenate([state, inputs], axis=1)
         _update_conv_cache(cache, self.conv_idx, state, inputs, mask)
+        if _fast_glue(x) and not self.training:
+            return _dynamic_conv(
+                x,
+                context,
+                self.weight_proj(dynamic_input),
+                self.static_weight,
+                self.num_heads,
+            )
         dynamic = (
             self.weight_proj(dynamic_input)
             .astype(mx.float32)
@@ -447,12 +511,21 @@ class Attention(nn.Module):
         )
         if not self.is_sliding and cfg.log_scaling_n_floor is not None:
             offset = kv.offset if kv is not None else 0
-            positions = mx.arange(length) + mx.array(offset)[..., None] + 1
-            tau = 1 + cfg.log_scaling_alpha * mx.log(
-                mx.maximum(positions / cfg.log_scaling_n_floor, 1)
-            )
-            q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
-            r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
+            if _fast_glue(x) and q.dtype == x.dtype and r.dtype == x.dtype:
+                q, r = _log_scale(
+                    q,
+                    r,
+                    mx.array(offset),
+                    cfg.log_scaling_alpha,
+                    cfg.log_scaling_n_floor,
+                )
+            else:
+                positions = mx.arange(length) + mx.array(offset)[..., None] + 1
+                tau = 1 + cfg.log_scaling_alpha * mx.log(
+                    mx.maximum(positions / cfg.log_scaling_n_floor, 1)
+                )
+                q = (q.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
+                r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         fast = FAST_DECODE and length == 1 and b == 1
         roll = 0
@@ -537,10 +610,13 @@ class Attention(nn.Module):
 
     def _finish(self, out, x, b, length):
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        out = (
-            out.astype(mx.float32)
-            * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
-        ).astype(x.dtype)
+        gate = self._project(self.gate_proj, x)
+        if _fast_glue(x) and not self.training and out.dtype == x.dtype:
+            out = _output_gate(out, gate)
+        else:
+            out = (
+                out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
+            ).astype(x.dtype)
         # Every output dot still consumes all heads on one rank. Gather the
         # heads first, project complete output rows, then restore hidden order.
         return self._gather_features(
@@ -765,11 +841,15 @@ class DecoderLayer(nn.Module):
             )
             parts = [norm(part).astype(x.dtype) for norm, part in zip(norms, parts)]
             attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
-        residual = self.attn_sconv(attn, conv, mask).astype(mx.float32)
+        glue = _fast_glue(x) and not self.training
+        attn_out = self.attn_sconv(attn, conv, mask)
         if self.is_block_boundary:
+            residual = attn_out.astype(mx.float32)
             blocks.append(x)
+        elif glue:
+            residual = _sum_f32(attn_out, x)
         else:
-            residual = residual + x.astype(mx.float32)
+            residual = attn_out.astype(mx.float32) + x.astype(mx.float32)
         hidden = self.mlp_input(blocks, residual)[..., 0, :]
         if messages is not None and self._fast_controllers(x):
             down, gates = self._controller_stack(("mlp",))
@@ -780,9 +860,11 @@ class DecoderLayer(nn.Module):
         elif messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         hidden = self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
-        out = (residual + self.mlp_sconv(hidden, conv, mask).astype(mx.float32)).astype(
-            x.dtype
-        )
+        mlp_out = self.mlp_sconv(hidden, conv, mask)
+        if glue:
+            out = _sum_f32_as(residual, mlp_out, x.dtype)
+        else:
+            out = (residual + mlp_out.astype(mx.float32)).astype(x.dtype)
         if conv is not None:
             conv.advance(x.shape[1])
         return out
