@@ -21,10 +21,10 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.2" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.3" torch torchvision
 ```
 
-This installs `mlx-vlm` version `0.8.0+inkling2mini.4`. Without the tool-call parser, stock MLX-VLM from main works too:
+This installs `mlx-vlm` version `0.8.0+inkling2mini.5`. Without the tool-call parser, stock MLX-VLM from main works too:
 `pip install "git+https://github.com/Neywa-Labs/mlx-vlm" torch torchvision`. PyTorch and torchvision are only used on the CPU by the image
 processor.
 
@@ -65,6 +65,11 @@ print(generate(model, processor, prompt, max_tokens=2048, draft_model=draft, dra
 A block size of 3–4 is fastest on this model (the draft's default of 8 is slower). On an idle MacBook Pro M5 Max, generation
 with DSpark was ×1.29 (4-8bit, block 3) to ×1.84 (2.5bit, block 4) faster; the model cards have the full speed tables.
 Server: add `--draft-model <same repo> --draft-kind dflash --draft-block-size 4`.
+
+Faster one-token decode (v0.2.3, on by default): the attention no longer copies its key/value history at every step.
+On an M5 Max with the 4-bit build, plain decode went from 41.0 to 44.6 tok/s at a 1K prompt and from 36.4 to 41.7 at 16K,
+and DSpark (block 4) from 85.4 to 90.9 tok/s at 16K. The output matches the old code up to bf16 rounding (same greedy
+tokens in our checks; drafted check rows are bit-identical). `INKLING2_FAST_DECODE=0` switches back to the old code.
 
 OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reasoning_content`):
 
