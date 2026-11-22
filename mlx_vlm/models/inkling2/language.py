@@ -76,6 +76,9 @@ FAST_MOE_VISIT = True
 # Sliding k/v short convolutions of a plain one-row step in one Metal kernel that
 # also writes both next conv states.
 FAST_SCONV_PAIR = True
+# Plain one-row step: the MoE weighted expert combine, mlp_sconv, its residual
+# add and its next fp32 conv state in one Metal kernel.
+FAST_COMBINE_SCONV = True
 
 _ROW_MASK_SRC = r"""
     const int B  = rel_shape[0];
@@ -824,6 +827,102 @@ def _sconv_pair(attn, k, v, conv, mask):
     return ko, vo
 
 
+_COMBINE_SCONV_SRC = r"""
+    uint c = thread_position_in_grid.x;
+    const int C = res_shape[2];
+    if ((int)c >= C) return;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float p = float(eo[(size_t)k * C + c]) * float(rw[k]);
+        acc = acc + p;
+    }
+    T h = T(acc);
+    float xh = float(h);
+    float s0 = state[c];
+    float s1 = state[C + c];
+    float s2 = state[2 * C + c];
+    float w0 = weight[c * 4 + 0];
+    float w1 = weight[c * 4 + 1];
+    float w2 = weight[c * 4 + 2];
+    float w3 = weight[c * 4 + 3];
+    float value = 0;
+    value = value + s0 * w0;
+    value = value + s1 * w1;
+    value = value + s2 * w2;
+    value = value + xh * w3;
+    T y = T((value + xh) / divisor);
+    out[c] = O(float(res[c]) + float(y));
+    ns[c] = s1;
+    ns[C + c] = s2;
+    ns[2 * C + c] = xh;
+"""
+_COMBINE_SCONV_KERNEL = []
+_COMBINE_SCONV_DIVISOR = {}
+
+
+def _combine_sconv_state(sconv, conv, mask, residual):
+    """The fp32 conv state when the combine+mlp_sconv kernel applies, else None."""
+    if not (
+        FAST_DECODE
+        and FAST_COMBINE_SCONV
+        and not sconv.training
+        and conv is not None
+        and mask is None
+        and not getattr(conv, "is_speculating", False)
+        and type(sconv) is ShortConvolution
+        and sconv.kernel_size == 4
+        and residual.ndim == 3
+        and residual.shape[0] == 1
+        and residual.shape[1] == 1
+        and residual.dtype == mx.float32
+        and residual.shape[-1] % 128 == 0
+        and mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+    ):
+        return None
+    width = residual.shape[-1]
+    state = conv[sconv.conv_idx]
+    weight = sconv.conv.weight
+    if (
+        state is None
+        or state.shape != (1, 3, width)
+        or state.dtype != mx.float32
+        or weight.shape != (width, 4, 1)
+    ):
+        return None
+    return state
+
+
+def _combine_sconv(sconv, conv, state, out, weights, residual, dtype):
+    """bf16(sum_k out_k * w_k) -> short conv -> residual + conv (dtype), and the
+    next fp32 conv state, in one launch for one plain row."""
+    if not _COMBINE_SCONV_KERNEL:
+        _COMBINE_SCONV_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_moe_combine_sconv",
+                input_names=["eo", "rw", "state", "weight", "res", "divisor"],
+                output_names=["out", "ns"],
+                source=_COMBINE_SCONV_SRC,
+                compile_options={"math_mode": "safe"},
+            )
+        )
+    divisor = _COMBINE_SCONV_DIVISOR.get(4)
+    if divisor is None:
+        divisor = mx.array(math.sqrt(4 + 1), mx.float32)
+        _COMBINE_SCONV_DIVISOR[4] = divisor
+    width = residual.shape[-1]
+    y, ns = _COMBINE_SCONV_KERNEL[0](
+        inputs=[out, weights, state, sconv.conv.weight, residual, divisor],
+        template=[("T", out.dtype), ("O", dtype), ("K", out.shape[-2])],
+        grid=(width, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[residual.shape, (1, 3, width)],
+        output_dtypes=[dtype, mx.float32],
+    )
+    conv[sconv.conv_idx] = ns
+    return y
+
+
 _MOE_VISIT = {}
 _MOE_VISIT_KEYS = ("weight", "scales", "biases")
 
@@ -832,7 +931,7 @@ def _moe_visit_fn(key):
     fn = _MOE_VISIT.get(key)
     if fn is not None:
         return fn
-    eps, dtype, top_k, route_scale, gate_cap, up_cap, quants = key
+    eps, dtype, top_k, route_scale, gate_cap, up_cap, quants, split = key
 
     def run(hidden, norm_w, gate_w, bias, *arrays):
         pos = 0
@@ -875,6 +974,8 @@ def _moe_visit_fn(key):
             * up_cap
         ).astype(gate.dtype)
         out = project(act, indices, projs[2]).squeeze(-2)
+        if split:
+            return out, weights
         return (
             (out.astype(mx.float32) * weights[..., None]).sum(axis=-2).astype(out.dtype)
         )
@@ -1388,7 +1489,7 @@ class SparseMoE(nn.Module):
             self._gate_weight_f32 = (weight, weight.astype(mx.float32))
         return self._gate_weight_f32[1]
 
-    def visit(self, hidden, norm, dtype):
+    def visit(self, hidden, norm, dtype, split=False):
         """norm -> cast -> route -> experts -> combine for one plain row as one
         compiled graph (same ops and order); None when not applicable."""
         sm = self.switch_mlp
@@ -1428,6 +1529,7 @@ class SparseMoE(nn.Module):
             act.gate_cap,
             act.up_cap,
             tuple(quants),
+            bool(split),
         )
         return _moe_visit_fn(key)(
             hidden,
@@ -1661,15 +1763,25 @@ class DecoderLayer(nn.Module):
             )[..., 0, :]
         elif messages is not None:
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
-        moe = self.mlp.visit(hidden, self.post_attention_layernorm, x.dtype)
-        hidden = (
-            moe
-            if moe is not None
-            else self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
+        state = None
+        if glue and x.dtype == mx.bfloat16 and residual.dtype == mx.float32:
+            state = _combine_sconv_state(self.mlp_sconv, conv, mask, residual)
+        moe = self.mlp.visit(
+            hidden, self.post_attention_layernorm, x.dtype, state is not None
         )
         out = None
-        if glue and hidden.dtype == x.dtype and residual.dtype == mx.float32:
-            out = self.mlp_sconv.fused(hidden, conv, mask, residual, 2)
+        if isinstance(moe, tuple):
+            out = _combine_sconv(
+                self.mlp_sconv, conv, state, moe[0], moe[1], residual, x.dtype
+            )
+        else:
+            hidden = (
+                moe
+                if moe is not None
+                else self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
+            )
+            if glue and hidden.dtype == x.dtype and residual.dtype == mx.float32:
+                out = self.mlp_sconv.fused(hidden, conv, mask, residual, 2)
         if out is None:
             mlp_out = self.mlp_sconv(hidden, conv, mask)
             if glue:
