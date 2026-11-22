@@ -1,1 +1,1 @@
-__version__ = "0.8.0+inkling2mini.5"
+__version__ = "0.8.0+inkling2mini.6"

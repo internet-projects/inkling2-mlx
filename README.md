@@ -21,10 +21,10 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.3" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.4" torch torchvision
 ```
 
-This installs `mlx-vlm` version `0.8.0+inkling2mini.5`. Without the tool-call parser, stock MLX-VLM from main works too:
+This installs `mlx-vlm` version `0.8.0+inkling2mini.6`. Without the tool-call parser, stock MLX-VLM from main works too:
 `pip install "git+https://github.com/Neywa-Labs/mlx-vlm" torch torchvision`. PyTorch and torchvision are only used on the CPU by the image
 processor.
 
@@ -70,6 +70,12 @@ Faster one-token decode (v0.2.3, on by default): the attention no longer copies 
 On an M5 Max with the 4-bit build, plain decode went from 41.0 to 44.6 tok/s at a 1K prompt and from 36.4 to 41.7 at 16K,
 and DSpark (block 4) from 85.4 to 90.9 tok/s at 16K. The output matches the old code up to bf16 rounding (same greedy
 tokens in our checks; drafted check rows are bit-identical). `INKLING2_FAST_DECODE=0` switches back to the old code.
+
+v0.2.4 adds compiled per-layer glue and controllers and three small Metal kernels (attention residuals and the
+loop's cross-pass messages, the q/k/r clip with the value norm, and the banded mask), all on by default and switched off
+by the same `INKLING2_FAST_DECODE=0`. On the same Mac and build, plain decode went from 44.6 to 59.7 tok/s at 1K and from
+41.6 to 55.1 at 16K; DSpark (block 4) from 102.6 to 118.0 at 1K and from 90.3 to 100.5 at 16K (KL max 0.008 against
+v0.2.3, same top token at every checked position). On CPU the plain MLX code runs instead of the kernels.
 
 OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reasoning_content`):
 

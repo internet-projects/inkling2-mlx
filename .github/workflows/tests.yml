@@ -144,6 +144,7 @@ jobs:
               tests/test_inkling_channels.py
               tests/test_inkling_tool_parser.py
               tests/test_inkling2_fast_decode.py
+              tests/test_inkling2_autospeed_attnres.py
               tests/test_processors.py
               tests/test_speculative.py
           - group: media

@@ -153,9 +153,8 @@ def _row_mask_fast(rel, proj, kref, size, sliding, rel_extent, roll):
 
 
 def _message_bank(states):
-    return mx.fast.rms_norm(
-        mx.stack(states, axis=-2).astype(mx.float32), None, 1e-6
-    )
+    return mx.fast.rms_norm(mx.stack(states, axis=-2).astype(mx.float32), None, 1e-6)
+
 
 _ATTN_RES_TG = 512
 _ATTN_RES_SRC = r"""
@@ -418,9 +417,9 @@ def _qkv_norm_fast(
 
 @mx.compile
 def _output_gate(out, gate):
-    return (
-        out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
-    ).astype(out.dtype)
+    return (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
+        out.dtype
+    )
 
 
 @mx.compile
@@ -1044,9 +1043,9 @@ class Attention(nn.Module):
         if _fast_glue(x) and not self.training and out.dtype == x.dtype:
             out = _output_gate(out, gate)
         else:
-            out = (
-                out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
-            ).astype(x.dtype)
+            out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
+                x.dtype
+            )
         # Every output dot still consumes all heads on one rank. Gather the
         # heads first, project complete output rows, then restore hidden order.
         return self._gather_features(
@@ -1255,7 +1254,10 @@ class DecoderLayer(nn.Module):
             if fast_ctrl:
                 down, gates = self._controller_stack(("attn", "k", "v"))
                 blended = _blend_controllers(
-                    mixed, messages[..., :3, :], down, gates,
+                    mixed,
+                    messages[..., :3, :],
+                    down,
+                    gates,
                     self.controllers["attn"].eps,
                 )
                 parts = [blended[..., i, :] for i in range(3)]
@@ -1297,7 +1299,10 @@ class DecoderLayer(nn.Module):
         if messages is not None and self._fast_controllers(x):
             down, gates = self._controller_stack(("mlp",))
             hidden = _blend_controllers(
-                hidden[..., None, :], messages[..., 3:, :], down, gates,
+                hidden[..., None, :],
+                messages[..., 3:, :],
+                down,
+                gates,
                 self.controllers["mlp"].eps,
             )[..., 0, :]
         elif messages is not None:
