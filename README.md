@@ -35,7 +35,8 @@ processor.
 | [netprojects/Inkling-2-Mini-MLX-4-8bit](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-4-8bit) | 19.5 GB + 0.64 GB draft | 4-bit NVFP4 + 8-bit MXFP8 experts as released (lossless), recommended |
 | [netprojects/Inkling-2-Mini-MLX-4bit](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-4bit) | 16.5 GB + 0.64 GB draft | plain affine 4-bit |
 | [netprojects/Inkling-2-Mini-MLX-3bit](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-3bit) | 14.1 GB + 0.64 GB draft | 3/4-bit experts, for 24 GB Macs (`prefill_step_size=256`) |
-| [netprojects/Inkling-2-Mini-MLX-2.5bit](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-2.5bit) | 10.8 GB + 0.64 GB draft | 2/3-bit experts, smallest; 16 GB Macs with a raised GPU limit (see its card) |
+| [netprojects/Inkling-2-Mini-MLX-2.5bit](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-2.5bit) | 10.8 GB + 0.64 GB draft | per-layer mixed 2/3-bit experts (new files 22 November 2026); 16 GB Macs with a raised GPU limit (see its card) |
+| [netprojects/Inkling-2-Mini-MLX-2bit-mixed](https://huggingface.co/netprojects/Inkling-2-Mini-MLX-2bit-mixed) | 9.5 GB + 0.64 GB draft | per-layer mixed, mostly 2-bit experts, smallest; for 16 GB Macs (see its card) |
 
 
 ## Use
@@ -63,7 +64,7 @@ print(generate(model, processor, prompt, max_tokens=2048, draft_model=draft, dra
 ```
 
 A block size of 3–4 is fastest on this model (the draft's default of 8 is slower). On an idle MacBook Pro M5 Max, generation
-with DSpark was ×1.29 (4-8bit, block 3) to ×1.84 (2.5bit, block 4) faster; the model cards have the full speed tables.
+with DSpark was ×1.29 (4-8bit, block 3) to ×1.69 (3bit, block 4) faster; the model cards have the full speed tables.
 Server: add `--draft-model <same repo> --draft-kind dflash --draft-block-size 4`.
 
 Faster one-token decode (v0.2.3, on by default): the attention no longer copies its key/value history at every step.
@@ -93,10 +94,13 @@ On a MacBook Pro M5 Max (128 GB), 21 November 2026, with this repository's MLX-V
 | 4-8bit (the release, lossless) | 98.4% | 0.0018 | 47/50 |
 | 4bit | 95.9% | 0.029 | 47/50 |
 | 3bit | 95.5% | 0.042 | 48/50 |
-| 2.5bit | 87.5% | 0.190 | 45/50 |
+| 2.5bit (22 November files) | 91.0% | 0.066 | 46/50 |
+| 2bit-mixed | 90.2% | 0.107 | 47/50 |
 
 The 4-8bit build's greedy answers to 3 prompts match Thinking Machines' code token for token (24 tokens each).
-Tool calls, coding tasks, thinking and image prompts pass on every build. 
+The 2.5bit and 2bit-mixed rows were measured on 22 November 2026 with the same code and texts, and repeated with v0.2.4 (same results).
+Tool calls, coding tasks and thinking pass on every build. Image prompts pass on the 3-bit and larger builds; the 2.5bit and
+2bit-mixed builds (2-bit vision encoder) get the colours and positions of the test image right but call its circle an oval.
 
 Known limitation: when the model calls a tool through `mlx_vlm.server`, `content` can also carry a short sentence of its
 reasoning.
