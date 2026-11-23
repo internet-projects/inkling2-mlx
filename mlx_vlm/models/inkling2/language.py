@@ -100,6 +100,13 @@ FAST_GATE_UP = True
 # One-row MoE visit: top-k selection, score gather and renormalise * route_scale
 # as one Metal kernel (the router matmul and sigmoid stay in MLX).
 FAST_TOPK = True
+# Relative mask from the raw r projection: the mask kernel applies the r l2 clip
+# itself (same lanes/arithmetic as the qkv-norm kernel) and takes the key count
+# from a small array, so it no longer waits for the norm kernel or the k update.
+FAST_MASK_RAW = True
+# Speculative check rows (2..8): top-k + renormalise * route_scale as the Metal
+# kernel after the unchanged compiled router matmul and sigmoid.
+FAST_TOPK_ROWS = True
 
 _METAL_OK = []
 
@@ -192,6 +199,118 @@ def _row_mask_fast(rel, proj, kref, size, sliding, rel_extent, roll):
         threadgroup=(tg, 1, 1),
         output_shapes=[(b, h, lq, size)],
         output_dtypes=[rel.dtype],
+    )[0]
+
+
+_ROW_MASK_RAW_SRC = r"""
+    const int B  = rel_shape[0];
+    const int LQ = rel_shape[1];
+    const int H  = rel_shape[2];
+    const int S  = meta[1];
+    uint p  = thread_position_in_grid.x;
+    uint i  = thread_position_in_grid.y;
+    uint bh = thread_position_in_grid.z;
+    uint lane = thread_index_in_simdgroup;
+    if ((int)i >= LQ || (int)bh >= B * H) return;
+    uint b = bh / H, h = bh % H;
+    const size_t rbase = (size_t)b * rel_strides[0]
+        + (size_t)i * rel_strides[1] + (size_t)h * rel_strides[2];
+    float rv = 0.0f;
+    if (lane < D_REL)
+        rv = float(rel[rbase + (size_t)lane * rel_strides[3]])
+            * float(rscale[(size_t)h * rscale_strides[0]
+                           + (size_t)lane * rscale_strides[1]]);
+    float ss = 0.0f;
+    ss += rv * rv;
+    ss = simd_sum(ss);
+    float f = metal::min(
+        metal::precise::divide(th[0], metal::precise::sqrt(ss) + 1e-6f), 1.0f);
+    float rc = float(T(rv * f));
+    float rr[D_REL];
+    for (uint d = 0; d < D_REL; ++d) rr[d] = simd_shuffle(rc, (ushort)d);
+    if ((int)p >= S) return;
+    int j = (int)p - meta[0];
+    if (j < 0) j += S;
+    int dist = ((int)i + (S - LQ)) - j;
+    T val;
+    if (dist < 0) {
+        val = (T)(-1e30f);
+    } else if (SLIDING > 0 && dist >= (int)SLIDING) {
+        val = (T)(-1e30f);
+    } else if (dist < (int)REL_EXTENT) {
+        float acc = 0.0f;
+        for (uint d = 0; d < D_REL; ++d)
+            acc += rr[d] * (float)proj[(size_t)d * proj_strides[0]
+                                       + (size_t)dist * proj_strides[1]];
+        val = (T)acc;
+    } else {
+        val = (T)0;
+    }
+    out[(((size_t)b * H + h) * LQ + i) * S + p] = val;
+"""
+_ROW_MASK_RAW_KERNEL = []
+_ROW_MASK_META = {}
+_ROW_MASK_TH = {}
+
+
+def _row_mask_raw(rp, rscale, rth, proj, size, sliding, rel_extent, roll):
+    """Banded mask [B, H, LQ, S] from the raw r projection rp [B, LQ, H, d_rel]:
+    r = bf16(l2_clip(rp * rscale, rth)) computed in-kernel exactly as the qkv-norm
+    kernel does (same simd lanes), then the same mask arithmetic as
+    _row_mask_fast. Only shape-free inputs, so it does not wait for the k
+    update. None when not applicable."""
+    if (
+        rp.ndim != 4
+        or rp.shape[1] > 8
+        or not 1 <= rp.shape[3] <= 32
+        or rp.dtype not in _ATTN_RES_DTYPES
+        or rscale.shape != (rp.shape[2], rp.shape[3])
+        or rscale.dtype not in _ATTN_RES_DTYPES
+        or proj.ndim != 2
+        or proj.shape[0] != rp.shape[3]
+        or proj.shape[1] < int(rel_extent)
+        or proj.dtype not in _ATTN_RES_DTYPES
+        or size < 1
+        or not _gpu_ok()
+    ):
+        return None
+    if not _ROW_MASK_RAW_KERNEL:
+        _ROW_MASK_RAW_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_banded_mask_rows_raw",
+                input_names=["rel", "proj", "rscale", "th", "meta"],
+                output_names=["out"],
+                source=_ROW_MASK_RAW_SRC,
+                ensure_row_contiguous=False,
+            )
+        )
+    size = int(size)
+    roll = int(roll) % size
+    key = (roll, size)
+    meta = _ROW_MASK_META.get(key)
+    if meta is None:
+        if len(_ROW_MASK_META) > 8192:
+            _ROW_MASK_META.clear()
+        meta = mx.array([roll, size], mx.int32)
+        _ROW_MASK_META[key] = meta
+    th = _ROW_MASK_TH.get(float(rth))
+    if th is None:
+        th = mx.array([float(rth)], mx.float32)
+        _ROW_MASK_TH[float(rth)] = th
+    b, lq, h, d_rel = rp.shape
+    tg = min(256, ((size + 31) // 32) * 32)
+    return _ROW_MASK_RAW_KERNEL[0](
+        inputs=[rp, proj, rscale, th, meta],
+        template=[
+            ("T", rp.dtype),
+            ("D_REL", d_rel),
+            ("REL_EXTENT", int(rel_extent)),
+            ("SLIDING", int(sliding)),
+        ],
+        grid=(((size + tg - 1) // tg) * tg, lq, b * h),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(b, h, lq, size)],
+        output_dtypes=[rp.dtype],
     )[0]
 
 
@@ -746,6 +865,11 @@ def _route(x, weight, bias, top_k, route_scale):
 
 
 @mx.compile
+def _route_scores(x, weight):
+    return mx.sigmoid(x.astype(mx.float32) @ weight.astype(mx.float32).T)
+
+
+@mx.compile
 def _combine_routes(out, weights):
     return (out.astype(mx.float32) * weights[..., None]).sum(axis=-2).astype(out.dtype)
 
@@ -1160,6 +1284,7 @@ def _combine_sconv(sconv, conv, state, out, weights, residual, dtype):
 
 _TOPK_SRC = r"""
     uint lane = thread_position_in_threadgroup.x;
+    uint row = threadgroup_position_in_grid.y;
     constexpr int PER = (E + 31) / 32;
     float sc[PER];
     float sel[PER];
@@ -1167,7 +1292,7 @@ _TOPK_SRC = r"""
     for (int t = 0; t < PER; ++t) {
         int j = (int)lane + t * 32;
         taken[t] = j >= E;
-        sc[t] = j < E ? float(scores[j]) : 0.0f;
+        sc[t] = j < E ? float(scores[(size_t)row * E + j]) : 0.0f;
         sel[t] = j < E ? sc[t] + float(bias[j]) : -INFINITY;
     }
     float wv[K];
@@ -1195,8 +1320,8 @@ _TOPK_SRC = r"""
         float denom = total + 1e-20f;
         float rs = scale[0];
         for (int k = 0; k < K; ++k) {
-            idx[k] = wi[k];
-            wts[k] = wv[k] / denom * rs;
+            idx[(size_t)row * K + k] = wi[k];
+            wts[(size_t)row * K + k] = wv[k] / denom * rs;
         }
     }
 """
@@ -1229,7 +1354,7 @@ def _topk_route(scores, bias, scale, top_k):
     idx, wts = _TOPK_KERNEL[0](
         inputs=[scores, bias, scale],
         template=[("E", scores.shape[-1]), ("K", top_k)],
-        grid=(32, 1, 1),
+        grid=(32, max(1, scores.size // scores.shape[-1]), 1),
         threadgroup=(32, 1, 1),
         output_shapes=[shape, shape],
         output_dtypes=[mx.uint32, mx.float32],
@@ -1608,8 +1733,11 @@ class Attention(nn.Module):
                 cfg.rel_l2_clip_threshold,
                 cfg.rms_norm_eps,
             )
+        raw_r = None
         if post is not None:
             q, k, v, r = post
+            if FAST_MASK_RAW:
+                raw_r = rp.reshape(b, length, self.n_heads, cfg.d_rel)
             q = q.reshape(b, length, self.n_heads, self.head_dim)
             k = k.reshape(b, length, self.n_kv, self.head_dim)
             v = v.reshape(b, length, self.n_kv, self.head_dim)
@@ -1647,6 +1775,7 @@ class Attention(nn.Module):
                 # tau == 1 exactly, so q and r are unchanged bit for bit.
                 pass
             elif _fast_glue(x) and q.dtype == x.dtype and r.dtype == x.dtype:
+                raw_r = None
                 q, r = _log_scale(
                     q,
                     r,
@@ -1655,6 +1784,7 @@ class Attention(nn.Module):
                     cfg.log_scaling_n_floor,
                 )
             else:
+                raw_r = None
                 positions = mx.arange(length) + mx.array(offset)[..., None] + 1
                 tau = 1 + cfg.log_scaling_alpha * mx.log(
                     mx.maximum(positions / cfg.log_scaling_n_floor, 1)
@@ -1718,9 +1848,21 @@ class Attention(nn.Module):
         proj = self["rel_proj"].astype(x.dtype)
         mask = None
         if FAST_DECODE and FAST_MASK and padding is None and not self.training:
-            mask = _row_mask_fast(
-                r, proj, kref, size, self.sliding, self.rel_extent, roll
-            )
+            if raw_r is not None:
+                mask = _row_mask_raw(
+                    raw_r,
+                    self["rel_scale"],
+                    cfg.rel_l2_clip_threshold,
+                    proj,
+                    size,
+                    self.sliding,
+                    self.rel_extent,
+                    roll,
+                )
+            if mask is None:
+                mask = _row_mask_fast(
+                    r, proj, kref, size, self.sliding, self.rel_extent, roll
+                )
             if mask is not None:
                 roll = 0
         if mask is None:
@@ -1978,14 +2120,42 @@ class SparseMoE(nn.Module):
         object.__setattr__(self, "_gate_up_cat", (src, cat))
         return cat
 
-    def __call__(self, x):
-        indices, weights = _route(
-            x,
-            self._gate_f32() if FAST_DECODE and FAST_GATE else self.gate_weight,
-            self.e_score_correction_bias,
-            self.top_k,
-            self.route_scale,
+    def _route_rows(self, x):
+        """Check rows: the same compiled router matmul + sigmoid as _route, then
+        the top-k Metal kernel per row; None when not applicable."""
+        bias = self["e_score_correction_bias"]
+        rows = self["gate_weight"].shape[0]
+        if not (
+            FAST_DECODE
+            and FAST_TOPK
+            and FAST_TOPK_ROWS
+            and not self.training
+            and x.ndim == 3
+            and 1 < x.shape[0] * x.shape[1] <= 8
+            and 1 <= self.top_k <= min(rows, 32)
+            and rows <= 4096
+            and bias.shape == (rows,)
+            and bias.dtype in _ATTN_RES_DTYPES
+            and _gpu_ok()
+        ):
+            return None
+        gate = self._gate_f32() if FAST_GATE else self.gate_weight
+        scores = _route_scores(x, gate)
+        return _topk_route(
+            scores, bias, _route_scale_array(self.route_scale), self.top_k
         )
+
+    def __call__(self, x):
+        routed = self._route_rows(x)
+        if routed is None:
+            routed = _route(
+                x,
+                self._gate_f32() if FAST_DECODE and FAST_GATE else self.gate_weight,
+                self.e_score_correction_bias,
+                self.top_k,
+                self.route_scale,
+            )
+        indices, weights = routed
         if self.sharding_group is None:
             if (
                 not self.training
