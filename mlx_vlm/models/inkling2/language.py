@@ -94,9 +94,6 @@ FAST_NORM_F32 = True
 FAST_HEAD_F32 = True
 # Final logit softcap as one compiled kernel for short rows.
 FAST_SOFTCAP = True
-# One-row MoE visit: experts' gate and up projections as one gather_qmm over a
-# cached [gate; up] concatenation (each output row is the same dot product).
-FAST_GATE_UP = True
 # One-row MoE visit: top-k selection, score gather and renormalise * route_scale
 # as one Metal kernel (the router matmul and sigmoid stay in MLX).
 FAST_TOPK = True
@@ -1384,10 +1381,8 @@ def _moe_visit_fn(key):
         up_cap,
         quants,
         split,
-        inter,
         topk,
     ) = key
-    fused = inter > 0
 
     def run(hidden, norm_w, gate_w, bias, scale, *arrays):
         pos = 0
@@ -1424,14 +1419,9 @@ def _moe_visit_fn(key):
                 weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
             )
         xe = mx.expand_dims(x, (-2, -3))
-        if fused:
-            gu = project(xe, indices, projs[0])
-            gate, up = gu[..., :inter], gu[..., inter:]
-            down = projs[1]
-        else:
-            up = project(xe, indices, projs[1])
-            gate = project(xe, indices, projs[0])
-            down = projs[2]
+        up = project(xe, indices, projs[1])
+        gate = project(xe, indices, projs[0])
+        down = projs[2]
         gf, uf = gate.astype(mx.float32), up.astype(mx.float32)
         act = (
             mx.tanh(gf / gate_cap)
@@ -2004,7 +1994,6 @@ class SparseMoE(nn.Module):
             hidden.dtype,
             bool(FAST_GATE),
             bool(FAST_NORM_F32),
-            bool(FAST_GATE_UP),
             bool(FAST_TOPK),
         )
         plan = plans.get(pkey)
@@ -2051,19 +2040,6 @@ class SparseMoE(nn.Module):
             ]
             quants.append((proj.group_size, proj.bits, proj.mode, b is not None))
             arrays += [w, s] if b is None else [w, s, b]
-        inter = 0
-        gp, upp = sm["gate_proj"], sm["up_proj"]
-        if (
-            FAST_GATE_UP
-            and quants[0] == quants[1]
-            and gp["weight"].ndim == 3
-            and gp["weight"].shape == upp["weight"].shape
-            and gp["scales"].shape == upp["scales"].shape
-        ):
-            n = 3 if quants[0][3] else 2
-            arrays = [*self._gate_up_cat(gp, upp), *arrays[2 * n :]]
-            quants = [quants[0], quants[2]]
-            inter = gp["weight"].shape[1]
         bias = self["e_score_correction_bias"]
         rows = self["gate_weight"].shape[0]
         topk = bool(
@@ -2082,7 +2058,6 @@ class SparseMoE(nn.Module):
             act.up_cap,
             tuple(quants),
             bool(split),
-            inter,
             topk,
         )
         norm_w = _norm_weight(norm, hidden)
@@ -2100,30 +2075,6 @@ class SparseMoE(nn.Module):
             _moe_visit_fn(key),
             (norm_w, gate, bias, _route_scale_array(self.route_scale), *arrays),
         )
-
-    def _gate_up_cat(self, gp, upp):
-        """[gate; up] experts concatenated on the output rows (weight, scales,
-        biases), built once and kept while the source arrays are unchanged."""
-        src = (
-            gp["weight"],
-            gp["scales"],
-            gp.get("biases"),
-            upp["weight"],
-            upp["scales"],
-            upp.get("biases"),
-        )
-        cached = vars(self).get("_gate_up_cat")
-        if cached is not None and all(a is b for a, b in zip(cached[0], src)):
-            return cached[1]
-        object.__setattr__(self, "_gate_up_cat", None)
-        cat = tuple(
-            mx.concatenate([g, u], axis=1)
-            for g, u in zip(src[:3], src[3:])
-            if g is not None
-        )
-        mx.eval(cat)
-        object.__setattr__(self, "_gate_up_cat", (src, cat))
-        return cat
 
     def _route_rows(self, x):
         """Check rows: the same compiled router matmul + sigmoid as _route, then
