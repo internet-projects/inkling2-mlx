@@ -21,7 +21,7 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.4" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.5" torch torchvision
 ```
 
 This installs `mlx-vlm` version `0.8.0+inkling2mini.6`. Without the tool-call parser, stock MLX-VLM from main works too:
@@ -63,8 +63,9 @@ draft, kind = load_drafter("netprojects/Inkling-2-Mini-MLX-4-8bit")
 print(generate(model, processor, prompt, max_tokens=2048, draft_model=draft, draft_kind=kind, draft_block_size=4).text)
 ```
 
-A block size of 3–4 is fastest on this model (the draft's default of 8 is slower). On an idle MacBook Pro M5 Max, generation
-with DSpark was ×1.29 (4-8bit, block 3) to ×1.69 (3bit, block 4) faster; the model cards have the full speed tables.
+Since v0.2.5, plain decode is fast enough that DSpark pays off mainly on text that repeats what came before (code edits,
+rewrites, structured output). For ordinary chat, plain decode is faster (see the v0.2.5 table below). Without a block size,
+DSpark now uses block 4 (it used the draft's 8, which is slower on chat).
 Server: add `--draft-model <same repo> --draft-kind dflash --draft-block-size 4`.
 
 Faster one-token decode (v0.2.3, on by default): the attention no longer copies its key/value history at every step.
@@ -77,6 +78,22 @@ loop's cross-pass messages, the q/k/r clip with the value norm, and the banded m
 by the same `INKLING2_FAST_DECODE=0`. On the same Mac and build, plain decode went from 44.6 to 59.7 tok/s at 1K and from
 41.6 to 55.1 at 16K; DSpark (block 4) from 102.6 to 118.0 at 1K and from 90.3 to 100.5 at 16K (KL max 0.008 against
 v0.2.3, same top token at every checked position). On CPU the plain MLX code runs instead of the kernels.
+
+v0.2.5 adds ten more decode changes (compiled one-row MoE and attention visits, launch trims, a top-k kernel for check
+rows, and overlapping the GPU with Python every 8 layer visits). Same Mac, 4-bit build, 23 November 2026, greedy, median
+of 3, against the original MLX-VLM (Neywa-Labs `f1618d6d`) and v0.2.4:
+
+| tok/s | MLX-VLM | v0.2.4 | v0.2.5 |
+|---|---|---|---|
+| Plain, 1K prompt | 40.7 | 59.5 | 84.1 (×2.07) |
+| Plain, 8K prompt | 38.5 | 57.2 | 79.7 (×2.07) |
+| DSpark block 4, 1K (repeated text) | 101.8 | 115.0 | 125.0 (×1.23) |
+| DSpark block 4, 8K (repeated text) | 95.9 | 107.0 | 114.9 (×1.20) |
+| Chat answer, 256 tokens, plain | 36.7 | 59.8 | 86.4 (×2.35) |
+| Chat answer, 256 tokens, DSpark block 4 | 50.0 | 59.7 | 64.3 |
+
+Against the original MLX-VLM: KL max 0.014, same top token at all 97 checked positions, same greedy text; peak memory
+26.4 GB (MLX-VLM 26.2). `INKLING2_FAST_DECODE=0` still switches all of it off.
 
 OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reasoning_content`):
 
