@@ -84,6 +84,28 @@ def inkling2_dspark_case(dtype=mx.float32, config=None):
     return target, draft
 
 
+@parametrize("trained,requested,expected", [(8, None, 4), (3, None, 3), (8, 6, 6)])
+def test_inkling2_dspark_default_runtime_block_size(trained, requested, expected):
+    from mlx_vlm.speculative.common import _dflash_block_total
+    from mlx_vlm.speculative.drafters.inkling2_dspark import ModelConfig as DraftConfig
+
+    text = deepcopy(model_case("inkling2")["config"]["text_config"])
+    draft = {**deepcopy(DATA["inkling2_dspark"]), "block_size": trained}
+    config = DraftConfig(
+        text_config={**text, "mtp_config": draft}, runtime_block_size=requested
+    )
+    assert config.block_size == trained
+    assert config.runtime_block_size == expected
+
+    class Draft:
+        pass
+
+    model = Draft()
+    model.config = config
+    assert _dflash_block_total(model, None) == expected
+    assert _dflash_block_total(model, 2) == 2
+
+
 @parametrize("location", ["root", "text", "loop"])
 def test_inkling2_dspark_native_and_standalone_loading(tmp_path, location):
     config = deepcopy(model_case("inkling2")["config"])

@@ -43,7 +43,9 @@ class ModelConfig(BaseModelConfig):
         self.unpadded_vocab_size = text.get("unpadded_vocab_size", self.vocab_size)
         self.final_logit_softcapping = text.get("final_logit_softcapping", 30.0)
         self.block_size = self.block_size or draft["block_size"]
-        self.runtime_block_size = self.runtime_block_size or self.block_size
+        # Without a requested size, check 3 drafted tokens per round (block 4):
+        # faster on this model than the drafter's trained width of 8.
+        self.runtime_block_size = self.runtime_block_size or min(4, self.block_size)
         if (
             draft.get("markov_head_type") != "rnn_hidden"
             or draft.get("q_bias")
