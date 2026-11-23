@@ -94,6 +94,12 @@ FAST_NORM_F32 = True
 FAST_HEAD_F32 = True
 # Final logit softcap as one compiled kernel for short rows.
 FAST_SOFTCAP = True
+# One-row MoE visit: experts' gate and up projections as one gather_qmm over a
+# cached [gate; up] concatenation (each output row is the same dot product).
+FAST_GATE_UP = True
+# One-row MoE visit: top-k selection, score gather and renormalise * route_scale
+# as one Metal kernel (the router matmul and sigmoid stay in MLX).
+FAST_TOPK = True
 
 _METAL_OK = []
 
@@ -1152,6 +1158,85 @@ def _combine_sconv(sconv, conv, state, out, weights, residual, dtype):
     return y
 
 
+_TOPK_SRC = r"""
+    uint lane = thread_position_in_threadgroup.x;
+    constexpr int PER = (E + 31) / 32;
+    float sc[PER];
+    float sel[PER];
+    bool taken[PER];
+    for (int t = 0; t < PER; ++t) {
+        int j = (int)lane + t * 32;
+        taken[t] = j >= E;
+        sc[t] = j < E ? float(scores[j]) : 0.0f;
+        sel[t] = j < E ? sc[t] + float(bias[j]) : -INFINITY;
+    }
+    float wv[K];
+    uint wi[K];
+    float total = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        float best = -INFINITY;
+        int bt = -1;
+        for (int t = 0; t < PER; ++t) {
+            if (!taken[t] && (bt < 0 || sel[t] > best)) {
+                best = sel[t];
+                bt = t;
+            }
+        }
+        float g = simd_max(bt >= 0 ? best : -INFINITY);
+        uint cand = (bt >= 0 && best == g) ? (uint)((int)lane + bt * 32) : 0xFFFFFFFFu;
+        uint win = simd_min(cand);
+        float w = simd_shuffle(bt >= 0 ? sc[bt] : 0.0f, (ushort)(win & 31u));
+        if (bt >= 0 && cand == win) taken[bt] = true;
+        wi[k] = win;
+        wv[k] = w;
+        total = total + w;
+    }
+    if (lane == 0) {
+        float denom = total + 1e-20f;
+        float rs = scale[0];
+        for (int k = 0; k < K; ++k) {
+            idx[k] = wi[k];
+            wts[k] = wv[k] / denom * rs;
+        }
+    }
+"""
+_TOPK_KERNEL = []
+_ROUTE_SCALE = {}
+
+
+def _route_scale_array(value):
+    arr = _ROUTE_SCALE.get(float(value))
+    if arr is None:
+        arr = mx.array([float(value)], mx.float32)
+        _ROUTE_SCALE[float(value)] = arr
+    return arr
+
+
+def _topk_route(scores, bias, scale, top_k):
+    """Top-k of scores + bias (lowest index on ties), weights = chosen scores /
+    (sum + 1e-20) * scale, for one row in one launch."""
+    if not _TOPK_KERNEL:
+        _TOPK_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_route_topk",
+                input_names=["scores", "bias", "scale"],
+                output_names=["idx", "wts"],
+                source=_TOPK_SRC,
+                compile_options={"math_mode": "safe"},
+            )
+        )
+    shape = (*scores.shape[:-1], top_k)
+    idx, wts = _TOPK_KERNEL[0](
+        inputs=[scores, bias, scale],
+        template=[("E", scores.shape[-1]), ("K", top_k)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[shape, shape],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return idx, wts
+
+
 _MOE_VISIT = {}
 _MOE_VISIT_KEYS = ("weight", "scales", "biases")
 
@@ -1160,9 +1245,21 @@ def _moe_visit_fn(key):
     fn = _MOE_VISIT.get(key)
     if fn is not None:
         return fn
-    eps, dtype, top_k, route_scale, gate_cap, up_cap, quants, split = key
+    (
+        eps,
+        dtype,
+        top_k,
+        route_scale,
+        gate_cap,
+        up_cap,
+        quants,
+        split,
+        inter,
+        topk,
+    ) = key
+    fused = inter > 0
 
-    def run(hidden, norm_w, gate_w, bias, *arrays):
+    def run(hidden, norm_w, gate_w, bias, scale, *arrays):
         pos = 0
         projs = []
         for group_size, bits, mode, has_b in quants:
@@ -1188,12 +1285,23 @@ def _moe_visit_fn(key):
 
         x = mx.fast.rms_norm(hidden, norm_w, eps).astype(dtype)
         scores = mx.sigmoid(x.astype(mx.float32) @ gate_w.astype(mx.float32).T)
-        indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
+        if topk:
+            indices, weights = _topk_route(scores, bias, scale, top_k)
+        else:
+            indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
+            weights = mx.take_along_axis(scores, indices, axis=-1)
+            weights = (
+                weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
+            )
         xe = mx.expand_dims(x, (-2, -3))
-        up = project(xe, indices, projs[1])
-        gate = project(xe, indices, projs[0])
+        if fused:
+            gu = project(xe, indices, projs[0])
+            gate, up = gu[..., :inter], gu[..., inter:]
+            down = projs[1]
+        else:
+            up = project(xe, indices, projs[1])
+            gate = project(xe, indices, projs[0])
+            down = projs[2]
         gf, uf = gate.astype(mx.float32), up.astype(mx.float32)
         act = (
             mx.tanh(gf / gate_cap)
@@ -1202,7 +1310,7 @@ def _moe_visit_fn(key):
             * mx.tanh(uf / up_cap)
             * up_cap
         ).astype(gate.dtype)
-        out = project(act, indices, projs[2]).squeeze(-2)
+        out = project(act, indices, down).squeeze(-2)
         if split:
             return out, weights
         return (
@@ -1743,7 +1851,15 @@ class SparseMoE(nn.Module):
         if plans is None:
             plans = {}
             object.__setattr__(self, "_visit_plans", plans)
-        pkey = (dtype, bool(split), hidden.dtype, bool(FAST_GATE), bool(FAST_NORM_F32))
+        pkey = (
+            dtype,
+            bool(split),
+            hidden.dtype,
+            bool(FAST_GATE),
+            bool(FAST_NORM_F32),
+            bool(FAST_GATE_UP),
+            bool(FAST_TOPK),
+        )
         plan = plans.get(pkey)
         if plan is not None:
             if plan[0] is not norm:
@@ -1788,6 +1904,28 @@ class SparseMoE(nn.Module):
             ]
             quants.append((proj.group_size, proj.bits, proj.mode, b is not None))
             arrays += [w, s] if b is None else [w, s, b]
+        inter = 0
+        gp, upp = sm["gate_proj"], sm["up_proj"]
+        if (
+            FAST_GATE_UP
+            and quants[0] == quants[1]
+            and gp["weight"].ndim == 3
+            and gp["weight"].shape == upp["weight"].shape
+            and gp["scales"].shape == upp["scales"].shape
+        ):
+            n = 3 if quants[0][3] else 2
+            arrays = [*self._gate_up_cat(gp, upp), *arrays[2 * n :]]
+            quants = [quants[0], quants[2]]
+            inter = gp["weight"].shape[1]
+        bias = self["e_score_correction_bias"]
+        rows = self["gate_weight"].shape[0]
+        topk = bool(
+            FAST_TOPK
+            and 1 <= self.top_k <= min(rows, 32)
+            and rows <= 4096
+            and bias.shape == (rows,)
+            and bias.dtype in _ATTN_RES_DTYPES
+        )
         key = (
             norm.eps,
             dtype,
@@ -1797,12 +1935,13 @@ class SparseMoE(nn.Module):
             act.up_cap,
             tuple(quants),
             bool(split),
+            inter,
+            topk,
         )
         norm_w = _norm_weight(norm, hidden)
         if norm_w is None:
             norm_w = norm["weight"]
         gate = self._gate_f32() if FAST_GATE else self["gate_weight"]
-        bias = self["e_score_correction_bias"]
         checks += [
             (norm, "weight", norm["weight"]),
             (self, "gate_weight", self["gate_weight"]),
@@ -1812,8 +1951,32 @@ class SparseMoE(nn.Module):
             norm,
             tuple(checks),
             _moe_visit_fn(key),
-            (norm_w, gate, bias, *arrays),
+            (norm_w, gate, bias, _route_scale_array(self.route_scale), *arrays),
         )
+
+    def _gate_up_cat(self, gp, upp):
+        """[gate; up] experts concatenated on the output rows (weight, scales,
+        biases), built once and kept while the source arrays are unchanged."""
+        src = (
+            gp["weight"],
+            gp["scales"],
+            gp.get("biases"),
+            upp["weight"],
+            upp["scales"],
+            upp.get("biases"),
+        )
+        cached = vars(self).get("_gate_up_cat")
+        if cached is not None and all(a is b for a, b in zip(cached[0], src)):
+            return cached[1]
+        object.__setattr__(self, "_gate_up_cat", None)
+        cat = tuple(
+            mx.concatenate([g, u], axis=1)
+            for g, u in zip(src[:3], src[3:])
+            if g is not None
+        )
+        mx.eval(cat)
+        object.__setattr__(self, "_gate_up_cat", (src, cat))
+        return cat
 
     def __call__(self, x):
         indices, weights = _route(
