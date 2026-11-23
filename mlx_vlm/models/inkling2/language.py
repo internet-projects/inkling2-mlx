@@ -37,6 +37,7 @@ from ..inkling.language import (
 )
 from ..switch_layers import QuantizedSwitchLinear, SwitchGLU
 from .config import TextConfig, validate_sharding
+from .kernels import short_convolution_residual
 
 # One-token decode without per-step copies of the key/value history (inkling2-mlx).
 # Off: the attention below runs exactly as upstream. On: a one-row step of a single
@@ -94,6 +95,16 @@ FAST_HEAD_F32 = True
 # Final logit softcap as one compiled kernel for short rows.
 FAST_SOFTCAP = True
 
+_METAL_OK = []
+
+
+def _gpu_ok():
+    """Metal is available (asked once per process) and the GPU is the default."""
+    if not _METAL_OK:
+        _METAL_OK.append(bool(mx.metal.is_available()))
+    return _METAL_OK[0] and mx.default_device() == mx.gpu
+
+
 _ROW_MASK_SRC = r"""
     const int B  = rel_shape[0];
     const int LQ = rel_shape[1];
@@ -141,8 +152,7 @@ def _row_mask_fast(rel, proj, kref, size, sliding, rel_extent, roll):
         or kref.shape[2] != size
         or size < 1
         or rel.dtype not in _ATTN_RES_DTYPES
-        or not mx.metal.is_available()
-        or mx.default_device() != mx.gpu
+        or not _gpu_ok()
     ):
         return None
     if not _ROW_MASK_KERNEL:
@@ -387,11 +397,12 @@ def _attention_residual_fast(blocks, partial, query, normalize_values):
         or query.ndim not in (1, 2)
         or query.shape[-1] != shape[-1]
         or query.dtype not in _ATTN_RES_DTYPES
-        or any(a.shape != shape or a.dtype not in _ATTN_RES_DTYPES for a in inputs)
-        or not mx.metal.is_available()
-        or mx.default_device() != mx.gpu
+        or not _gpu_ok()
     ):
         return None
+    for a in inputs:
+        if a.shape != shape or a.dtype not in _ATTN_RES_DTYPES:
+            return None
     width = shape[-1]
     nq = 1 if query.ndim == 1 else query.shape[0]
     if nq < 1 or nq > 4:
@@ -494,7 +505,7 @@ def _norm_weight(norm, x):
         and x.dtype == mx.float32
     ):
         return None
-    weight = norm.weight
+    weight = norm["weight"]
     if weight.dtype == mx.float32:
         return weight
     cached = norm.get("_weight_f32")
@@ -591,8 +602,7 @@ def _qkv_norm_fast(
         or r.shape != (q.shape[0], q.shape[1], n_heads * d_rel)
         or q_scale.shape != (n_heads, head_dim)
         or rel_scale.shape != (n_heads, d_rel)
-        or not mx.metal.is_available()
-        or mx.default_device() != mx.gpu
+        or not _gpu_ok()
     ):
         return None
     if not _QKV_NORM_KERNEL:
@@ -879,8 +889,7 @@ def _dyn_conv_ok(mod, x, dyn, cache, mask):
         and x.shape[-1] % mod.num_heads == 0
         and mod.static_weight.shape == (k, x.shape[-1])
         and mod.static_weight.dtype in _ATTN_RES_DTYPES
-        and mx.metal.is_available()
-        and mx.default_device() == mx.gpu
+        and _gpu_ok()
     ):
         return False
     state = cache[mod.conv_idx]
@@ -914,7 +923,7 @@ def _dyn_conv_fast(mod, x, dyn, cache):
     state = cache[mod.conv_idx]
     length, width = x.shape[1], x.shape[2]
     out, ctx = _DYN_CONV_KERNEL[0](
-        inputs=[x, state, mod.static_weight, dyn, divisor],
+        inputs=[x, state, mod["static_weight"], dyn, divisor],
         template=[
             ("T", x.dtype),
             ("NH", mod.num_heads),
@@ -980,7 +989,7 @@ def _sconv_pair(attn, k, v, conv, mask):
     """k_sconv and v_sconv of a plain one-row sliding step in one launch, with
     the next fp32 conv states written by the kernel; None when not applicable.
     Same per-element arithmetic as short_convolution and _next_conv_state."""
-    ksc, vsc = attn.k_sconv, attn.v_sconv
+    ksc, vsc = attn["k_sconv"], attn["v_sconv"]
     if not (
         FAST_DECODE
         and FAST_SCONV_PAIR
@@ -999,13 +1008,12 @@ def _sconv_pair(attn, k, v, conv, mask):
         and k.dtype == mx.bfloat16
         and v.dtype == k.dtype
         and k.shape[-1] % 128 == 0
-        and mx.metal.is_available()
-        and mx.default_device() == mx.gpu
+        and _gpu_ok()
     ):
         return None
     width = k.shape[-1]
     ks, vs = conv[ksc.conv_idx], conv[vsc.conv_idx]
-    kw, vw = ksc.conv.weight, vsc.conv.weight
+    kw, vw = ksc["conv"]["weight"], vsc["conv"]["weight"]
     if (
         ks is None
         or vs is None
@@ -1098,13 +1106,12 @@ def _combine_sconv_state(sconv, conv, mask, residual):
         and residual.shape[1] == 1
         and residual.dtype == mx.float32
         and residual.shape[-1] % 128 == 0
-        and mx.metal.is_available()
-        and mx.default_device() == mx.gpu
+        and _gpu_ok()
     ):
         return None
     width = residual.shape[-1]
     state = conv[sconv.conv_idx]
-    weight = sconv.conv.weight
+    weight = sconv["conv"]["weight"]
     if (
         state is None
         or state.shape != (1, 3, width)
@@ -1134,7 +1141,7 @@ def _combine_sconv(sconv, conv, state, out, weights, residual, dtype):
         _COMBINE_SCONV_DIVISOR[4] = divisor
     width = residual.shape[-1]
     y, ns = _COMBINE_SCONV_KERNEL[0](
-        inputs=[out, weights, state, sconv.conv.weight, residual, divisor],
+        inputs=[out, weights, state, sconv["conv"]["weight"], residual, divisor],
         template=[("T", out.dtype), ("O", dtype), ("K", out.shape[-2])],
         grid=(width, 1, 1),
         threadgroup=(256, 1, 1),
@@ -1229,18 +1236,15 @@ class ShortConvolution(InklingShortConvolution):
                     and residual.dtype in (mx.float32, mx.bfloat16, mx.float16)
                 )
             )
-            and mx.metal.is_available()
-            and mx.default_device() == mx.gpu
+            and _gpu_ok()
         ):
             return None
-        from .kernels import short_convolution_residual
-
         state = cache[self.conv_idx] if cache is not None else None
         if state is None:
             state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]))
         _update_conv_cache(cache, self.conv_idx, state, x, mask)
         return short_convolution_residual(
-            state, self.conv.weight, x, mask, self.kernel_size, residual, mode
+            state, self["conv"]["weight"], x, mask, self.kernel_size, residual, mode
         )
 
     def __call__(self, x, cache=None, mask=None):
@@ -1291,7 +1295,7 @@ class DynamicShortConvolution(nn.Module):
     def __call__(self, x, dynamic_input, cache=None, mask=None):
         b, length, channels = x.shape
         k = self.kernel_size
-        dyn = self.weight_proj(dynamic_input)
+        dyn = self["weight_proj"](dynamic_input)
         if _dyn_conv_ok(self, x, dyn, cache, mask):
             return _dyn_conv_fast(self, x, dyn, cache)
         xf = x.astype(mx.float32)
@@ -1459,20 +1463,20 @@ class Attention(nn.Module):
         kv, conv = cache if cache is not None else (None, None)
         key_input = x if key_input is None else key_input
         value_input = x if value_input is None else value_input
-        k = self._project(self.k_proj, key_input)
-        v = self._project(self.v_proj, value_input)
+        k = self._project(self["k_proj"], key_input)
+        v = self._project(self["v_proj"], value_input)
         if self.is_sliding:
             pair = _sconv_pair(self, k, v, conv, conv_mask)
             if pair is None:
-                k = self.k_sconv(k, conv, conv_mask)
-                v = self.v_sconv(v, conv, conv_mask)
+                k = self["k_sconv"](k, conv, conv_mask)
+                v = self["v_sconv"](v, conv, conv_mask)
             else:
                 k, v = pair
         else:
-            k = self.k_sconv(k, key_input, conv, conv_mask)
-            v = self.v_sconv(v, value_input, conv, conv_mask)
-        qp = self._project(self.q_proj, x)
-        rp = self._project(self.r_proj, x)
+            k = self["k_sconv"](k, key_input, conv, conv_mask)
+            v = self["v_sconv"](v, value_input, conv, conv_mask)
+        qp = self._project(self["q_proj"], x)
+        rp = self._project(self["r_proj"], x)
         post = None
         if (
             FAST_DECODE
@@ -1486,8 +1490,8 @@ class Attention(nn.Module):
                 k,
                 v,
                 rp,
-                self.q_scale,
-                self.rel_scale,
+                self["q_scale"],
+                self["rel_scale"],
                 self.n_heads,
                 self.n_kv,
                 self.head_dim,
@@ -1603,7 +1607,7 @@ class Attention(nn.Module):
         size = k.shape[2] - (1 if slot else 0)
         padding = getattr(kv, "left_padding", None)
         kref = k[..., :size, :] if slot else k
-        proj = self.rel_proj.astype(x.dtype)
+        proj = self["rel_proj"].astype(x.dtype)
         mask = None
         if FAST_DECODE and FAST_MASK and padding is None and not self.training:
             mask = _row_mask_fast(
@@ -1627,7 +1631,7 @@ class Attention(nn.Module):
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
         if roll:
             mask = mx.roll(mask, roll, axis=-1)
-        sinks = self.sink_proj(x)
+        sinks = self["sink_proj"](x)
         if self.sharding_group is not None:
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
         if fast and FAST_SINK:
@@ -1668,7 +1672,7 @@ class Attention(nn.Module):
 
     def _finish(self, out, x, b, length):
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        gate = self._project(self.gate_proj, x)
+        gate = self._project(self["gate_proj"], x)
         if _fast_glue(x) and not self.training and out.dtype == x.dtype:
             out = _output_gate(out, gate)
         else:
@@ -1678,7 +1682,7 @@ class Attention(nn.Module):
         # Every output dot still consumes all heads on one rank. Gather the
         # heads first, project complete output rows, then restore hidden order.
         return self._gather_features(
-            self._project(self.o_proj, self._gather_features(out))
+            self._project(self["o_proj"], self._gather_features(out))
         )
 
 
@@ -1722,8 +1726,9 @@ class SparseMoE(nn.Module):
 
     def visit(self, hidden, norm, dtype, split=False):
         """norm -> cast -> route -> experts -> combine for one plain row as one
-        compiled graph (same ops and order); None when not applicable."""
-        sm = self.switch_mlp
+        compiled graph (same ops and order); None when not applicable. The
+        compiled function and its arguments are reused while every source
+        module and array is still the same object."""
         if not (
             FAST_DECODE
             and FAST_MOE_VISIT
@@ -1731,27 +1736,58 @@ class SparseMoE(nn.Module):
             and self.sharding_group is None
             and hidden.ndim == 3
             and hidden.shape[0] * hidden.shape[1] == 1
-            and type(norm) is nn.RMSNorm
-            and type(sm) is SwitchGLU
-            and type(sm.activation) is SoftcappedSwiGLU
-            and mx.metal.is_available()
-            and mx.default_device() == mx.gpu
+            and _gpu_ok()
         ):
             return None
+        plans = vars(self).get("_visit_plans")
+        if plans is None:
+            plans = {}
+            object.__setattr__(self, "_visit_plans", plans)
+        pkey = (dtype, bool(split), hidden.dtype, bool(FAST_GATE), bool(FAST_NORM_F32))
+        plan = plans.get(pkey)
+        if plan is not None:
+            if plan[0] is not norm:
+                plan = None
+            else:
+                for parent, name, value in plan[1]:
+                    if parent.get(name) is not value:
+                        plan = None
+                        break
+        if plan is None:
+            plan = self._visit_plan(hidden, norm, dtype, split)
+            if plan is None:
+                return None
+            plans[pkey] = plan
+        return plan[2](hidden, *plan[3])
+
+    def _visit_plan(self, hidden, norm, dtype, split):
+        sm = self.get("switch_mlp")
+        if not (
+            type(norm) is nn.RMSNorm
+            and type(sm) is SwitchGLU
+            and type(sm.get("activation")) is SoftcappedSwiGLU
+        ):
+            return None
+        act = sm["activation"]
+        checks = [(self, "switch_mlp", sm), (sm, "activation", act)]
         quants = []
         arrays = []
-        for proj in (sm.gate_proj, sm.up_proj, sm.down_proj):
+        for pname in ("gate_proj", "up_proj", "down_proj"):
+            proj = sm.get(pname)
             if type(proj) is not QuantizedSwitchLinear or any(
                 name not in _MOE_VISIT_KEYS for name in proj
             ):
                 return None
-            b = proj.get("biases")
+            w, s, b = proj["weight"], proj["scales"], proj.get("biases")
+            checks += [
+                (sm, pname, proj),
+                (proj, "weight", w),
+                (proj, "scales", s),
+                (proj, "biases", b),
+                (proj, "bias", None),
+            ]
             quants.append((proj.group_size, proj.bits, proj.mode, b is not None))
-            arrays.append(proj["weight"])
-            arrays.append(proj["scales"])
-            if b is not None:
-                arrays.append(b)
-        act = sm.activation
+            arrays += [w, s] if b is None else [w, s, b]
         key = (
             norm.eps,
             dtype,
@@ -1764,13 +1800,19 @@ class SparseMoE(nn.Module):
         )
         norm_w = _norm_weight(norm, hidden)
         if norm_w is None:
-            norm_w = norm.weight
-        return _moe_visit_fn(key)(
-            hidden,
-            norm_w,
-            self._gate_f32() if FAST_GATE else self.gate_weight,
-            self.e_score_correction_bias,
-            *arrays,
+            norm_w = norm["weight"]
+        gate = self._gate_f32() if FAST_GATE else self["gate_weight"]
+        bias = self["e_score_correction_bias"]
+        checks += [
+            (norm, "weight", norm["weight"]),
+            (self, "gate_weight", self["gate_weight"]),
+            (self, "e_score_correction_bias", bias),
+        ]
+        return (
+            norm,
+            tuple(checks),
+            _moe_visit_fn(key),
+            (norm_w, gate, bias, *arrays),
         )
 
     def __call__(self, x):
@@ -1814,7 +1856,7 @@ class AttentionResidual(nn.Module):
     def __call__(self, blocks, partial):
         if FAST_DECODE and FAST_ATTN_RES and not self.training:
             out = _attention_residual_fast(
-                blocks, partial, self.query, self.normalize_values
+                blocks, partial, self["query"], self.normalize_values
             )
             if out is not None:
                 return out
@@ -1889,10 +1931,12 @@ class DecoderLayer(nn.Module):
 
     def _controller_stack(self, names):
         # Stacked controller weights, rebuilt only when the weights change.
-        ctrls = [self.controllers[n] for n in names]
-        sources = tuple(
-            a for c in ctrls for a in (c.down_weight, c.forget_weight, c.gain_weight)
-        )
+        controllers = self["controllers"]
+        ctrls = [controllers[n] for n in names]
+        sources = []
+        for c in ctrls:
+            sources += (c["down_weight"], c["forget_weight"], c["gain_weight"])
+        sources = tuple(sources)
         stacks = vars(self).get("_ctrl_stacks")
         if stacks is None:
             stacks = {}
@@ -1928,14 +1972,15 @@ class DecoderLayer(nn.Module):
             mask = None
         else:
             mask = _cache_padding_mask(conv, x.shape[1])
+        attention_input = self.get("attention_input")
         mixed = (
-            self.attention_input(blocks, x)
-            if self.attention_input is not None
+            attention_input(blocks, x)
+            if attention_input is not None
             else x[..., None, :]
         )
         if self.is_sliding and messages is None:
-            attn = self.self_attn(
-                _rms(self.input_layernorm, mixed[..., 0, :]).astype(x.dtype),
+            attn = self["self_attn"](
+                _rms(self["input_layernorm"], mixed[..., 0, :]).astype(x.dtype),
                 cache=cache,
                 conv_mask=mask,
             )
@@ -1959,22 +2004,22 @@ class DecoderLayer(nn.Module):
                     for i, (name, part) in enumerate(zip(("attn", "k", "v"), parts))
                 ]
             norms = (
-                (self.input_layernorm,) * 3
+                (self["input_layernorm"],) * 3
                 if self.is_sliding
                 else (
-                    self.q_input_layernorm,
-                    self.k_input_layernorm,
-                    self.v_input_layernorm,
+                    self["q_input_layernorm"],
+                    self["k_input_layernorm"],
+                    self["v_input_layernorm"],
                 )
             )
             parts = [
                 _rms(norm, part).astype(x.dtype) for norm, part in zip(norms, parts)
             ]
-            attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
+            attn = self["self_attn"](*parts, cache=cache, conv_mask=mask)
         glue = _fast_glue(x) and not self.training
         residual = None
         if glue:
-            residual = self.attn_sconv.fused(
+            residual = self["attn_sconv"].fused(
                 attn, conv, mask, None if self.is_block_boundary else x, 1
             )
         if residual is None:
@@ -1987,7 +2032,7 @@ class DecoderLayer(nn.Module):
                 residual = attn_out.astype(mx.float32) + x.astype(mx.float32)
         if self.is_block_boundary:
             blocks.append(x)
-        hidden = self.mlp_input(blocks, residual)[..., 0, :]
+        hidden = self["mlp_input"](blocks, residual)[..., 0, :]
         if messages is not None and self._fast_controllers(x):
             down, gates = self._controller_stack(("mlp",))
             hidden = _blend_controllers(
@@ -2001,14 +2046,14 @@ class DecoderLayer(nn.Module):
             hidden = self.controllers["mlp"](hidden, messages[..., 3, :])
         state = None
         if glue and x.dtype == mx.bfloat16 and residual.dtype == mx.float32:
-            state = _combine_sconv_state(self.mlp_sconv, conv, mask, residual)
-        moe = self.mlp.visit(
-            hidden, self.post_attention_layernorm, x.dtype, state is not None
+            state = _combine_sconv_state(self["mlp_sconv"], conv, mask, residual)
+        moe = self["mlp"].visit(
+            hidden, self["post_attention_layernorm"], x.dtype, state is not None
         )
         out = None
         if isinstance(moe, tuple):
             out = _combine_sconv(
-                self.mlp_sconv, conv, state, moe[0], moe[1], residual, x.dtype
+                self["mlp_sconv"], conv, state, moe[0], moe[1], residual, x.dtype
             )
         else:
             hidden = (
@@ -2019,7 +2064,7 @@ class DecoderLayer(nn.Module):
                 )
             )
             if glue and hidden.dtype == x.dtype and residual.dtype == mx.float32:
-                out = self.mlp_sconv.fused(hidden, conv, mask, residual, 2)
+                out = self["mlp_sconv"].fused(hidden, conv, mask, residual, 2)
         if out is None:
             mlp_out = self.mlp_sconv(hidden, conv, mask)
             if glue:
@@ -2077,6 +2122,7 @@ class TextModel(nn.Module):
             raise ValueError(
                 "Inkling 2 requires a separate cache for every layer visit"
             )
+        layers = self["layers"]
         for visit, index in enumerate(self.layer_indices):
             if self.loop is not None and index == self.loop.core_start:
                 if visit == index:
@@ -2120,7 +2166,7 @@ class TextModel(nn.Module):
             # DSpark taps the partial block entering the layer, not its output.
             if visit in requested:
                 captures[visit] = x
-            x = self.layers[index](x, blocks, cache[visit] if cache else None, messages)
+            x = layers[index](x, blocks, cache[visit] if cache else None, messages)
             if speculative_verify and (visit + 1) % 4 == 0:
                 mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
