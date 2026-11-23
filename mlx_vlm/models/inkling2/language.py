@@ -107,6 +107,11 @@ FAST_MASK_RAW = True
 # Speculative check rows (2..8): top-k + renormalise * route_scale as the Metal
 # kernel after the unchanged compiled router matmul and sigmoid.
 FAST_TOPK_ROWS = True
+# Plain one-row decode steps: start evaluating the hidden state every
+# FAST_ASYNC_EVERY layer visits (as speculative checks do), so the GPU runs the
+# early visits while Python builds the later ones. Same ops, same results.
+FAST_ASYNC_STEPS = True
+FAST_ASYNC_EVERY = 8
 
 _METAL_OK = []
 
@@ -2456,6 +2461,17 @@ class TextModel(nn.Module):
                 "Inkling 2 requires a separate cache for every layer visit"
             )
         layers = self["layers"]
+        total_visits = len(self.layer_indices)
+        chunked = bool(
+            FAST_DECODE
+            and FAST_ASYNC_STEPS
+            and FAST_ASYNC_EVERY > 0
+            and not speculative_verify
+            and not self.training
+            and cache
+            and x.ndim == 3
+            and x.shape[0] * x.shape[1] == 1
+        )
         for visit, index in enumerate(self.layer_indices):
             if self.loop is not None and index == self.loop.core_start:
                 if visit == index:
@@ -2501,6 +2517,12 @@ class TextModel(nn.Module):
                 captures[visit] = x
             x = layers[index](x, blocks, cache[visit] if cache else None, messages)
             if speculative_verify and (visit + 1) % 4 == 0:
+                mx.async_eval(x)
+            elif (
+                chunked
+                and (visit + 1) % FAST_ASYNC_EVERY == 0
+                and visit + 1 < total_visits
+            ):
                 mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
         normalized = _rms(self.norm, h).astype(x.dtype)
