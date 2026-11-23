@@ -85,6 +85,14 @@ FAST_DYN_CONV = True
 # Global layers: skip the log-position scaling while it is exactly 1 (all positions
 # <= log_scaling_n_floor, so log(max(p/floor, 1)) == 0).
 FAST_LOG_SKIP = True
+# Looped passes: every core layer's cross-pass messages in one launch per pass.
+FAST_PASS_MESSAGES = True
+# RMSNorm on FP32 rows reads a cached exact FP32 copy of its weight.
+FAST_NORM_F32 = True
+# Quantized affine lm_head on FP32 rows reads cached exact FP32 scales/biases.
+FAST_HEAD_F32 = True
+# Final logit softcap as one compiled kernel for short rows.
+FAST_SOFTCAP = True
 
 _ROW_MASK_SRC = r"""
     const int B  = rel_shape[0];
@@ -402,6 +410,110 @@ def _attention_residual_fast(blocks, partial, query, normalize_values):
         output_shapes=[(shape[0], shape[1], nq, width)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+_ATTN_RES_LAYERED = {}
+
+
+def _attention_residual_layers(blocks, partial, queries, normalize_values):
+    """The one-pass attention-residual kernel for every query set of queries
+    [layers, nq, D] in one launch (grid z = layer); per layer the same
+    arithmetic as _attention_residual_fast. None when not applicable."""
+    inputs = [*blocks, partial]
+    shape = partial.shape
+    if (
+        not FAST_ATTN_RES_ONEPASS
+        or len(shape) != 3
+        or shape[0] * shape[1] > 8
+        or len(inputs) > 8
+        or queries.ndim != 3
+        or not 1 <= queries.shape[1] <= 4
+        or queries.shape[-1] != shape[-1]
+        or queries.dtype not in _ATTN_RES_DTYPES
+        or any(a.shape != shape or a.dtype not in _ATTN_RES_DTYPES for a in inputs)
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    count = len(inputs)
+    kernel = _ATTN_RES_LAYERED.get(count)
+    if kernel is None:
+        fused = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]); acc[{k}] += v * v;"
+            f" for (uint q = 0; q < NQ; ++q) acc[NB + {k} * NQ + q] += v * qv[q]; }}"
+            for k in range(count)
+        )
+        values = "\n".join(
+            f"        {{ float v = float(x{k}[base + d]);"
+            f" vals[{k}] = NORMALIZE ? v * inv[{k}] : v; }}"
+            for k in range(count)
+        )
+        source = (
+            _ATTN_RES_ONEPASS_SRC.replace("@NB@", str(count))
+            .replace("@FUSED@", fused)
+            .replace("@VALUES@", values)
+            .replace("query[q * D + d]", "query[((size_t)layer * NQ + q) * D + d]")
+            .replace(
+                "out[((size_t)row * NQ + q) * D + d]",
+                "out[(((size_t)layer * ROWS + row) * NQ + q) * D + d]",
+            )
+        )
+        kernel = mx.fast.metal_kernel(
+            name=f"inkling2_attention_residual_layers_{count}",
+            input_names=[*(f"x{k}" for k in range(count)), "query"],
+            output_names=["out"],
+            source="    uint layer = threadgroup_position_in_grid.z;\n" + source,
+        )
+        _ATTN_RES_LAYERED[count] = kernel
+    layers, nq, width = queries.shape
+    rows = shape[0] * shape[1]
+    return kernel(
+        inputs=[*inputs, queries],
+        template=[
+            ("TG", _ATTN_RES_TG),
+            ("NQ", nq),
+            ("D", width),
+            ("NORMALIZE", bool(normalize_values)),
+            ("ROWS", rows),
+        ],
+        grid=(_ATTN_RES_TG, rows, layers),
+        threadgroup=(_ATTN_RES_TG, 1, 1),
+        output_shapes=[(layers, shape[0], shape[1], nq, width)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def _norm_weight(norm, x):
+    """An exact FP32 copy of an RMSNorm weight for FP32 rows (rms_norm would
+    cast the weight on every call); None when not applicable."""
+    if not (
+        FAST_DECODE
+        and FAST_NORM_F32
+        and type(norm) is nn.RMSNorm
+        and not norm.training
+        and x.dtype == mx.float32
+    ):
+        return None
+    weight = norm.weight
+    if weight.dtype == mx.float32:
+        return weight
+    cached = norm.get("_weight_f32")
+    if cached is None or cached[0] is not weight:
+        cached = (weight, weight.astype(mx.float32))
+        norm._weight_f32 = cached
+    return cached[1]
+
+
+def _rms(norm, x):
+    weight = _norm_weight(norm, x)
+    if weight is None:
+        return norm(x)
+    return mx.fast.rms_norm(x, weight, norm.eps)
+
+
+@mx.compile
+def _softcap(logits, cap):
+    return mx.tanh(logits / cap) * cap
 
 
 def _fast_glue(x):
@@ -1650,9 +1762,12 @@ class SparseMoE(nn.Module):
             tuple(quants),
             bool(split),
         )
+        norm_w = _norm_weight(norm, hidden)
+        if norm_w is None:
+            norm_w = norm.weight
         return _moe_visit_fn(key)(
             hidden,
-            norm.weight,
+            norm_w,
             self._gate_f32() if FAST_GATE else self.gate_weight,
             self.e_score_correction_bias,
             *arrays,
@@ -1820,7 +1935,7 @@ class DecoderLayer(nn.Module):
         )
         if self.is_sliding and messages is None:
             attn = self.self_attn(
-                self.input_layernorm(mixed[..., 0, :]).astype(x.dtype),
+                _rms(self.input_layernorm, mixed[..., 0, :]).astype(x.dtype),
                 cache=cache,
                 conv_mask=mask,
             )
@@ -1852,7 +1967,9 @@ class DecoderLayer(nn.Module):
                     self.v_input_layernorm,
                 )
             )
-            parts = [norm(part).astype(x.dtype) for norm, part in zip(norms, parts)]
+            parts = [
+                _rms(norm, part).astype(x.dtype) for norm, part in zip(norms, parts)
+            ]
             attn = self.self_attn(*parts, cache=cache, conv_mask=mask)
         glue = _fast_glue(x) and not self.training
         residual = None
@@ -1897,7 +2014,9 @@ class DecoderLayer(nn.Module):
             hidden = (
                 moe
                 if moe is not None
-                else self.mlp(self.post_attention_layernorm(hidden).astype(x.dtype))
+                else self.mlp(
+                    _rms(self.post_attention_layernorm, hidden).astype(x.dtype)
+                )
             )
             if glue and hidden.dtype == x.dtype and residual.dtype == mx.float32:
                 out = self.mlp_sconv.fused(hidden, conv, mask, residual, 2)
@@ -1953,6 +2072,7 @@ class TextModel(nn.Module):
         blocks = []
         bank = None
         bank_states = None
+        pass_messages = None
         if cache and len(cache) != len(self.layer_indices):
             raise ValueError(
                 "Inkling 2 requires a separate cache for every layer visit"
@@ -1966,6 +2086,7 @@ class TextModel(nn.Module):
                     # Only completed core blocks and the last partial supply messages.
                     bank_states = [*blocks[len(prelude_blocks) + 1 :], x]
                     bank = None
+                    pass_messages = None
                     if not (
                         FAST_DECODE
                         and FAST_MESSAGES
@@ -1974,9 +2095,18 @@ class TextModel(nn.Module):
                         and x.shape[0] * x.shape[1] <= 8
                     ):
                         bank = _message_bank(bank_states)
+                    elif FAST_PASS_MESSAGES:
+                        pass_messages = _attention_residual_layers(
+                            bank_states[:-1],
+                            bank_states[-1],
+                            self.message_queries,
+                            True,
+                        )
                     x, blocks = prelude, prelude_blocks.copy()
             messages = None
-            if bank_states is not None and index < self.loop.core_end:
+            if pass_messages is not None and index < self.loop.core_end:
+                messages = pass_messages[index - self.loop.core_start]
+            elif bank_states is not None and index < self.loop.core_end:
                 query = self.message_queries[index - self.loop.core_start]
                 if bank is None:
                     messages = _attention_residual_fast(
@@ -1994,7 +2124,7 @@ class TextModel(nn.Module):
             if speculative_verify and (visit + 1) % 4 == 0:
                 mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
-        normalized = self.norm(h).astype(x.dtype)
+        normalized = _rms(self.norm, h).astype(x.dtype)
         if len(self.layer_indices) in requested:
             captures[len(self.layer_indices)] = normalized
         result = h if skip_final_norm else normalized
@@ -2051,7 +2181,7 @@ class LanguageModel(InklingLanguageModel):
                 logits=(
                     None
                     if skip_logits
-                    else self._logits_from_norm(self.model.norm(pre_norm))
+                    else self._logits_from_norm(_rms(self.model.norm, pre_norm))
                 ),
                 hidden_states=(
                     captured
@@ -2117,6 +2247,47 @@ class LanguageModel(InklingLanguageModel):
             mx.clear_cache()
         self.sharding_group = group
 
+    def _quantized_head_f32(self, h):
+        """Quantized affine head on FP32 rows with cached exact FP32 scales and
+        biases (quantized_matmul would cast them on every call); None when not
+        applicable."""
+        head = self.lm_head
+        if not (
+            FAST_DECODE
+            and FAST_HEAD_F32
+            and not self.training
+            and type(head) is nn.QuantizedLinear
+            and self.sharding_group is None
+            and "bias" not in head
+            and getattr(head, "mode", "affine") == "affine"
+            and head.get("biases") is not None
+            and h.dtype == mx.float32
+            and h.ndim == 3
+            and h.shape[0] * h.shape[1] <= 15
+            and head["scales"].dtype != mx.float32
+        ):
+            return None
+        scales, biases = head["scales"], head["biases"]
+        cached = self.get("_head_f32_scales")
+        if cached is None or cached[0] is not scales or cached[1] is not biases:
+            self._head_f32_scales = (
+                scales,
+                biases,
+                scales.astype(mx.float32),
+                biases.astype(mx.float32),
+            )
+        s32, b32 = self._head_f32_scales[2], self._head_f32_scales[3]
+        return mx.quantized_matmul(
+            h,
+            head["weight"],
+            s32,
+            b32,
+            transpose=True,
+            group_size=head.group_size,
+            bits=head.bits,
+            mode="affine",
+        )
+
     def _logits_from_norm(self, h):
         # hf_quant_config.json stores BF16 unembedding weights but requires
         # fwd_output_dtype=float32. Promote the product before multiplication;
@@ -2158,10 +2329,21 @@ class LanguageModel(InklingLanguageModel):
                     .reshape(*h.shape[:-1], weight.shape[0])
                 )
         else:
-            logits = self.lm_head(h)
+            logits = self._quantized_head_f32(h)
+            if logits is None:
+                logits = self.lm_head(h)
         cap = self.config.final_logit_softcapping
         if cap:
-            logits = mx.tanh(logits / cap) * cap
+            if (
+                FAST_DECODE
+                and FAST_SOFTCAP
+                and not self.training
+                and h.ndim == 3
+                and h.shape[0] * h.shape[1] <= 15
+            ):
+                logits = _softcap(logits, cap)
+            else:
+                logits = mx.tanh(logits / cap) * cap
         return logits[..., : self.config.unpadded_vocab_size]
 
     def make_cache(self):
