@@ -57,6 +57,7 @@ def test_prefill_glue_same_logits(loop, monkeypatch):
         monkeypatch.setattr(L, "PREFILL_CTRL_COMPILE", on)
         monkeypatch.setattr(L, "PREFILL_ATTN_RES", on)
         monkeypatch.setattr(L, "PREFILL_SCONV", on)
+        monkeypatch.setattr(L, "PREFILL_MASK_SINK", on)
         cache = lm.make_cache()
         out = lm(mx.array([tokens]), cache=cache).logits
         nxt = lm(mx.array([[3]]), cache=cache).logits
@@ -78,3 +79,23 @@ def test_sconv_lags_matches_conv1d():
     ) ** 0.5
     out = L._sconv_lags(context, weight, xf, k)
     assert mx.allclose(out, ref, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="kernel needs Metal")
+def test_mask_with_sink_matches_concat():
+    from mlx_vlm.models.inkling.language import banded_additive_mask
+
+    mx.random.seed(4)
+    B, LQ, H, d_rel, S, extent = 1, 40, 6, 16, 70, 32
+    rel = mx.random.normal((B, LQ, H, d_rel)).astype(mx.bfloat16)
+    proj = mx.random.normal((d_rel, extent)).astype(mx.bfloat16)
+    kref = mx.zeros((B, 2, S, 8), mx.bfloat16)
+    sinks = mx.random.normal((B, LQ, H)).astype(mx.bfloat16)
+    for sliding in (0, 24):
+        ref = banded_additive_mask(
+            rel, proj, S - LQ, S, sliding, extent, shape_ref=kref
+        )
+        ref = mx.concatenate([ref, sinks.transpose(0, 2, 1)[..., None]], axis=-1)
+        out = L._mask_with_sink(rel, proj, kref, sliding, extent, sinks)
+        assert out is not None and out.shape == ref.shape
+        assert mx.array_equal(out, ref).item()

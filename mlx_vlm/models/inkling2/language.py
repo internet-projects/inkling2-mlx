@@ -66,6 +66,9 @@ PREFILL_ATTN_RES = True
 PREFILL_CTRL_COMPILE = True
 # Prefill short convolutions as shifted multiply-adds instead of a grouped conv1d.
 PREFILL_SCONV = True
+# Prefill: the banded mask kernel writes the sink logit as its last column, so the
+# (heads x rows x keys) mask is not copied again to append it.
+PREFILL_MASK_SINK = True
 # Attention-residual kernel: sum of squares and query dots in one pass.
 FAST_ATTN_RES_ONEPASS = True
 # One Metal kernel for the q/k/r l2 clips and the value RMS norm (short rows).
@@ -118,6 +121,79 @@ FAST_ASYNC_STEPS = True
 FAST_ASYNC_EVERY = 8
 
 _METAL_OK = []
+
+
+_MASK_SINK_SRC = r"""
+    // banded_additive_mask (inkling_banded_mask_v2) with one more column: column S
+    // holds the row's sink logit. Same arithmetic for every other element.
+    const int B  = rel_shape[0];
+    const int LQ = rel_shape[1];
+    const int H  = rel_shape[2];
+    const int S  = kshape_shape[2];
+    uint j  = thread_position_in_grid.x;   // key position [0, S], S = sink
+    uint i  = thread_position_in_grid.y;   // query position [0, LQ)
+    uint bh = thread_position_in_grid.z;   // b * H + h
+    if ((int)i >= LQ || (int)j > S || (int)bh >= B * H) return;
+    uint b = bh / H, h = bh % H;
+    T val;
+    if ((int)j == S) {
+        val = (T)sinks[(size_t)b * sinks_strides[0] + (size_t)i * sinks_strides[1]
+                       + (size_t)h * sinks_strides[2]];
+    } else {
+        int dist = ((int)i + (S - LQ)) - (int)j;
+        if (dist < 0) {
+            val = (T)(-1e30f);
+        } else if (SLIDING > 0 && dist >= (int)SLIDING) {
+            val = (T)(-1e30f);
+        } else if (dist < (int)REL_EXTENT) {
+            float acc = 0.0f;
+            const size_t rbase = (size_t)b * rel_strides[0]
+                + (size_t)i * rel_strides[1] + (size_t)h * rel_strides[2];
+            for (uint d = 0; d < D_REL; ++d)
+                acc += (float)rel[rbase + (size_t)d * rel_strides[3]]
+                     * (float)proj[(size_t)d * proj_strides[0]
+                                   + (size_t)dist * proj_strides[1]];
+            val = (T)acc;
+        } else {
+            val = (T)0;
+        }
+    }
+    out[(((size_t)b * H + h) * LQ + i) * (S + 1) + j] = val;
+"""
+_MASK_SINK_KERNEL = []
+
+
+def _mask_with_sink(rel, proj, kref, sliding, rel_extent, sinks):
+    """[B, H, LQ, S + 1]: banded_additive_mask(rel, proj, S - LQ, S, ...) with the
+    sink logits sinks [B, LQ, H] as the last column; None when not applicable."""
+    B, LQ, H, d_rel = rel.shape
+    S = kref.shape[2]
+    if not (PREFILL_MASK_SINK and sinks.shape == (B, LQ, H) and S >= LQ and _gpu_ok()):
+        return None
+    if not _MASK_SINK_KERNEL:
+        _MASK_SINK_KERNEL.append(
+            mx.fast.metal_kernel(
+                name="inkling2_banded_mask_sink",
+                input_names=["rel", "proj", "kshape", "sinks"],
+                output_names=["out"],
+                source=_MASK_SINK_SRC,
+                ensure_row_contiguous=False,
+            )
+        )
+    rup = lambda a: ((a + 7) // 8) * 8  # noqa: E731
+    return _MASK_SINK_KERNEL[0](
+        inputs=[rel, proj, kref, sinks],
+        template=[
+            ("T", rel.dtype),
+            ("D_REL", d_rel),
+            ("REL_EXTENT", int(rel_extent)),
+            ("SLIDING", int(sliding)),
+        ],
+        grid=(rup(S + 1), rup(LQ), B * H),
+        threadgroup=(8, 8, 1),
+        output_shapes=[(B, H, LQ, S + 1)],
+        output_dtypes=[rel.dtype],
+    )[0]
 
 
 def _gpu_ok():
@@ -1883,6 +1959,18 @@ class Attention(nn.Module):
                 )
             if mask is not None:
                 roll = 0
+        sinks = None
+        if (
+            mask is None
+            and padding is None
+            and not self.training
+            and length > 8
+            and self.sharding_group is None
+        ):
+            sinks = self["sink_proj"](x)
+            mask = _mask_with_sink(r, proj, kref, self.sliding, self.rel_extent, sinks)
+            if mask is None:
+                sinks = None
         if mask is None:
             mask = banded_additive_mask(
                 r,
@@ -1897,6 +1985,19 @@ class Attention(nn.Module):
         # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
+        if sinks is not None:
+            # The mask already ends with the sink column.
+            if not slot:
+                k = mx.concatenate(
+                    [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+                )
+                v = mx.concatenate(
+                    [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+                )
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.head_dim**-0.5, mask=mask
+            )
+            return self._finish(out, x, b, length)
         if roll:
             mask = mx.roll(mask, roll, axis=-1)
         sinks = self["sink_proj"](x)
