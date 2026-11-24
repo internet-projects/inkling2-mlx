@@ -146,6 +146,7 @@ jobs:
               tests/test_inkling2_fast_decode.py
               tests/test_inkling2_autospeed_attnres.py
               tests/test_inkling2_autospeed_rawmask.py
+              tests/test_inkling2_prefill_glue.py
               tests/test_processors.py
               tests/test_speculative.py
           - group: media

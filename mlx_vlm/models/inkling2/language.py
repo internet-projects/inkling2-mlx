@@ -16,6 +16,7 @@
 
 import math
 import os
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -59,6 +60,12 @@ FAST_SINK = FAST_ROLL = FAST_GATE = FAST_SLOT = FAST_CTRL = True
 FAST_GLUE = True
 # One Metal kernel per attention-residual mix for short (decode/check) rows.
 FAST_ATTN_RES = True
+# Prefill: the same per-row kernel for the depth reads of a whole chunk (no stacked
+# FP32 copy of every block), and the message controller as one compiled graph.
+PREFILL_ATTN_RES = True
+PREFILL_CTRL_COMPILE = True
+# Prefill short convolutions as shifted multiply-adds instead of a grouped conv1d.
+PREFILL_SCONV = True
 # Attention-residual kernel: sum of squares and query dots in one pass.
 FAST_ATTN_RES_ONEPASS = True
 # One Metal kernel for the q/k/r l2 clips and the value RMS norm (short rows).
@@ -519,7 +526,7 @@ def _attention_residual_fast(blocks, partial, query, normalize_values):
     shape = partial.shape
     if (
         len(shape) != 3
-        or shape[0] * shape[1] > 8
+        or (shape[0] * shape[1] > 8 and not PREFILL_ATTN_RES)
         or len(inputs) > 8
         or query.ndim not in (1, 2)
         or query.shape[-1] != shape[-1]
@@ -1442,6 +1449,18 @@ def _moe_visit_fn(key):
     return fn
 
 
+@partial(mx.compile, shapeless=False)
+def _sconv_lags(context, weight, xf, k):
+    """The depthwise causal conv of a prefill chunk as k shifted multiply-adds in
+    one compiled graph (FP32, like mx.conv1d on the same context and weight)."""
+    length = xf.shape[1]
+    w = weight.astype(mx.float32)[:, :, 0]
+    out = context[:, 0:length] * w[:, 0]
+    for lag in range(1, k):
+        out = out + context[:, lag : lag + length] * w[:, lag]
+    return (out + xf) / math.sqrt(k + 1)
+
+
 class ShortConvolution(InklingShortConvolution):
     def fused(self, x, cache, mask, residual, mode):
         """Decode kernel with the decoder's residual add folded in; None when the
@@ -1503,6 +1522,10 @@ class ShortConvolution(InklingShortConvolution):
         inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         context = mx.concatenate([state, inputs], axis=1)
         _update_conv_cache(cache, self.conv_idx, state, inputs, mask)
+        if PREFILL_SCONV and not self.training and x.shape[1] > 8:
+            return _sconv_lags(context, self.conv.weight, xf, self.kernel_size).astype(
+                x.dtype
+            )
         out = mx.conv1d(
             context, self.conv.weight.astype(mx.float32), groups=x.shape[-1]
         )
@@ -2154,6 +2177,18 @@ class AttentionResidual(nn.Module):
         )
 
 
+@partial(mx.compile, shapeless=False)
+def _message_ctrl(x, message, down, forget_w, gain_w, eps):
+    """MessageController.__call__ as one compiled graph (the same ops)."""
+    pair = mx.concatenate(
+        [mx.fast.rms_norm(v, None, eps) for v in (x, message)], axis=-1
+    )
+    hidden = (pair.astype(down.dtype) @ down.T).astype(mx.float32)
+    forget = mx.tanh(hidden @ forget_w.T)
+    gain = mx.tanh(hidden @ gain_w.T)
+    return (1 - forget) * x + gain * message
+
+
 class MessageController(nn.Module):
     """Blend a previous pass's message into one sublayer input."""
 
@@ -2166,6 +2201,20 @@ class MessageController(nn.Module):
         self.eps = config.rms_norm_eps
 
     def __call__(self, x, message):
+        if (
+            PREFILL_CTRL_COMPILE
+            and not self.training
+            and x.ndim == 3
+            and x.shape[1] > 8
+        ):
+            return _message_ctrl(
+                x,
+                message,
+                self.down_weight,
+                self.forget_weight,
+                self.gain_weight,
+                self.eps,
+            )
         pair = mx.concatenate(
             [mx.fast.rms_norm(v, None, self.eps) for v in (x, message)], axis=-1
         )
