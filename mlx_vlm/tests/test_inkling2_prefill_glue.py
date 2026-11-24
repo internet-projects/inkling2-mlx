@@ -56,7 +56,6 @@ def test_prefill_glue_same_logits(loop, monkeypatch):
     def run(on):
         monkeypatch.setattr(L, "PREFILL_CTRL_COMPILE", on)
         monkeypatch.setattr(L, "PREFILL_ATTN_RES", on)
-        monkeypatch.setattr(L, "PREFILL_SCONV", on)
         monkeypatch.setattr(L, "PREFILL_MASK_SINK", on)
         cache = lm.make_cache()
         out = lm(mx.array([tokens]), cache=cache).logits
@@ -66,19 +65,6 @@ def test_prefill_glue_same_logits(loop, monkeypatch):
 
     a, b = run(False), run(True)
     assert mx.allclose(a, b, atol=1e-4, rtol=1e-4).item(), float(mx.abs(a - b).max())
-
-
-def test_sconv_lags_matches_conv1d():
-    mx.random.seed(3)
-    k, c, length = 4, 32, 50
-    context = mx.random.normal((1, length + k - 1, c))
-    xf = context[:, k - 1 :]
-    weight = mx.random.normal((c, k, 1)).astype(mx.bfloat16)
-    ref = (mx.conv1d(context, weight.astype(mx.float32), groups=c) + xf) / (
-        k + 1
-    ) ** 0.5
-    out = L._sconv_lags(context, weight, xf, k)
-    assert mx.allclose(out, ref, atol=1e-5, rtol=1e-5).item()
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="kernel needs Metal")

@@ -21,7 +21,7 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.5" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.6" torch torchvision
 ```
 
 This installs `mlx-vlm` version `0.8.0+inkling2mini.6`. Without the tool-call parser, stock MLX-VLM from main works too:
@@ -94,6 +94,17 @@ of 3, against the original MLX-VLM (Neywa-Labs `f1618d6d`) and v0.2.4:
 
 Against the original MLX-VLM: KL max 0.014, same top token at all 97 checked positions, same greedy text; peak memory
 26.4 GB (MLX-VLM 26.2). `INKLING2_FAST_DECODE=0` still switches all of it off.
+
+v0.2.6 speeds up prompt reading (prefill): the depth reads of a whole prompt chunk go through the attention-residual
+kernel, the loop's message controller runs as one compiled graph, and the banded mask kernel writes the sink logit as
+its last column (no second copy of the heads x rows x keys mask). Same Mac and build, 24 November 2026:
+
+| Prefill tok/s | v0.2.5 | v0.2.6 |
+|---|---|---|
+| 8.7K prompt | 1467 | 1642 (+12%) |
+| 16K prompt | 1382 | 1608 (+16%) |
+
+KL max 0.0025 against v0.2.5, same 64 greedy tokens. Decode is unchanged. `INKLING2_FAST_DECODE=0` switches these off too.
 
 OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reasoning_content`):
 
