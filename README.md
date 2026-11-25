@@ -21,7 +21,7 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.6" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.7" torch torchvision
 ```
 
 This installs `mlx-vlm` version `0.8.0+inkling2mini.6`. Without the tool-call parser, stock MLX-VLM from main works too:
@@ -105,6 +105,22 @@ its last column (no second copy of the heads x rows x keys mask). Same Mac and b
 | 16K prompt | 1382 | 1608 (+16%) |
 
 KL max 0.0025 against v0.2.5, same 64 greedy tokens. Decode is unchanged. `INKLING2_FAST_DECODE=0` switches these off too.
+
+v0.2.7 makes sampled DSpark faster. The target now checks the draft with speculative (rejection) sampling: a drafted
+token is kept with probability min(1, p/q), and the first rejected position is drawn from the leftover of the target
+distribution. The output follows the same temperature, top-p and top-k law as plain decode; before, a drafted token was
+kept only when the target's own random draw happened to match it. Same Mac, 4-bit build, 256 new tokens, thinking off,
+DSpark block 4, 25 November 2026:
+
+| tok/s | plain | DSpark v0.2.6 | DSpark v0.2.7 |
+|---|---|---|---|
+| Rewrite, temperature 1.0 | 83.3 | 92.9 | 97.4 |
+| Rewrite, temperature 1.0, top-p 0.95 | 82.0 | 76.6 | 96.6 |
+| Chat, temperature 1.0 | 86.2 | 54.6 | 58.2 |
+
+So DSpark is now the faster choice for sampled code edits and rewrites too; for chat, plain decode stays faster.
+With a seed, v0.2.7 DSpark output follows the same law as plain decode but is not token-identical to it;
+`MLX_VLM_DSPARK_REJECTION=0` restores the old check, which is.
 
 OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reasoning_content`):
 
