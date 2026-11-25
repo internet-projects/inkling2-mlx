@@ -500,6 +500,8 @@ def test_inkling2_dspark_markov_head_reference(dtype):
 def test_inkling2_dspark_standard_generation_and_reset(
     temperature, prefill_step_size, dtype, monkeypatch
 ):
+    # Token-identical output needs the key-coupled walk (see the batch test).
+    monkeypatch.setenv("MLX_VLM_DSPARK_REJECTION", "0")
     mx.random.seed(73)
     target, draft = inkling2_dspark_case(dtype)
     calls = []
@@ -741,8 +743,14 @@ def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
 @parametrize("sampling", ["greedy", "random", "positioned"])
 @parametrize("phased", [False, True])
 @parametrize("family", ["mistral", "inkling2"])
-def test_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased, family):
+def test_dspark_admits_requests_while_batch_is_active(
+    cancel, sampling, phased, family, monkeypatch
+):
     from types import SimpleNamespace
+
+    # Token-identical to the drafter-free run needs the key-coupled walk;
+    # rejection sampling (the default) keeps the same law, not the same tokens.
+    monkeypatch.setenv("MLX_VLM_DSPARK_REJECTION", "0")
 
     from mlx_vlm.generate.ar import BatchGenerator
     from mlx_vlm.sample_utils import make_sampler

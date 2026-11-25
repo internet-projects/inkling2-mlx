@@ -192,6 +192,8 @@ class MarkovHead(nn.Module):
 
 class Model(nn.Module):
     prefer_requested_block_size = True
+    # Sampled rounds keep the draft logits for speculative (rejection) sampling.
+    records_draft_logits = True
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -422,6 +424,8 @@ class Model(nn.Module):
         context = self.markov_head.context(x, f_rnn)
         state = mx.zeros((anchor.size, self.config.markov_rank), x.dtype)
         previous, tokens = anchor, []
+        record = getattr(self, "_draft_logits_log", None)
+        seen = []
         for i in range(count):
             state, bias = self.markov_head.step(state, previous, context[:, i])
             logits = base[:, i] + bias
@@ -430,6 +434,11 @@ class Model(nn.Module):
                 logits = (cap * mx.tanh(logits.astype(mx.float32) / cap)).astype(
                     x.dtype
                 )
-            previous = sampler(logits[:, : self.config.unpadded_vocab_size]).reshape(-1)
+            logits = logits[:, : self.config.unpadded_vocab_size]
+            if record is not None:
+                seen.append(logits)
+            previous = sampler(logits).reshape(-1)
             tokens.append(previous[:, None])
+        if record is not None:
+            record.append(mx.stack(seen, axis=1))
         return mx.concatenate(tokens, axis=1).astype(token_dtype)

@@ -296,6 +296,16 @@ def generate_step(
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
         if (
+            seed is None
+            and temperature > 0
+            and getattr(draft_model, "records_draft_logits", False)
+            and os.environ.get("MLX_VLM_DSPARK_REJECTION", "1").lower()
+            not in ("0", "false", "no", "off")
+        ):
+            # Rejection sampling needs the sampler's law; draw a run seed from
+            # the global RNG so mx.random.seed still governs reproducibility.
+            seed = int(mx.random.randint(0, 2**31 - 1, ()).item())
+        if (
             seed is not None
             and temperature > 0
             and min_p == DEFAULT_MIN_P

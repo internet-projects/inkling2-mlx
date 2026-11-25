@@ -1,10 +1,12 @@
 import copy
+import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .. import apc
+from ..sample_utils import apply_top_k, apply_top_p
 from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _apply_thinking_budget,
@@ -244,6 +246,175 @@ def _dflash_target_logprobs(logits: mx.array) -> mx.array:
     )
 
 
+# Drafters that set ``records_draft_logits`` keep the logits they sampled
+# their proposals from, so a sampled round can use speculative (rejection)
+# sampling: accept draft x with probability min(1, p(x) / q(x)) and, on the
+# first rejection, draw from the normalized residual max(0, p - q). The
+# committed tokens then follow the target's filtered distribution exactly,
+# while acceptance is 1 - TV(p, q) instead of the chance that two independent
+# (or key-coupled) draws agree. Set MLX_VLM_DSPARK_REJECTION=0 to disable.
+_REJECTION_ENV = "MLX_VLM_DSPARK_REJECTION"
+_ACCEPT_SALT = 0x5A17ACC3
+_RESIDUAL_SALT = 0x2E51D0A1
+
+
+def _rejection_enabled() -> bool:
+    return os.environ.get(_REJECTION_ENV, "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _rejection_params(sampler: Callable) -> Optional[Tuple[float, float, int]]:
+    """(temperature, top_p, top_k) when the sampler's law is reproducible here."""
+    temperature = getattr(sampler, "temperature", None)
+    if temperature is None or not _supports_positioned_target_sampling(sampler):
+        return None
+    if not getattr(sampler, "_top_p_after_temperature", True):
+        return None  # top-n-sigma / p-less / typical filters: keep the old walk
+    if float(temperature) <= 0:
+        return None
+    return (
+        float(temperature),
+        float(getattr(sampler, "top_p", 1.0)),
+        int(getattr(sampler, "top_k", 0) or 0),
+    )
+
+
+def _filtered_logprobs(
+    logits: mx.array, temperature: float, top_p: float, top_k: int
+) -> mx.array:
+    """Normalized log-law that the positioned samplers draw from."""
+    x = logits.astype(mx.float32)
+    if top_k > 0:
+        x = apply_top_k(x, min(top_k, x.shape[-1]))
+    x = x / temperature
+    x = x - mx.logsumexp(x, axis=-1, keepdims=True)
+    if 0 < top_p < 1:
+        x = apply_top_p(x, top_p)
+        x = x - mx.logsumexp(x, axis=-1, keepdims=True)
+    return x
+
+
+def _mix32(seed: int, row: int, position: int) -> int:
+    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
+    x = (x + (int(row) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
+    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return int(x & 0xFFFFFFFF)
+
+
+def _round_keys(seed, salt, row_ids, base_positions, length):
+    return mx.stack(
+        [
+            mx.random.key(_mix32(int(seed) ^ salt, row, base + i))
+            for row, base in zip(row_ids, base_positions)
+            for i in range(length)
+        ]
+    )
+
+
+def take_draft_logits(draft_model, rows: int, count: int) -> Optional[mx.array]:
+    """Pop the logits a recording drafter sampled this round's rows from."""
+    log = getattr(draft_model, "_draft_logits_log", None)
+    if log is None:
+        return None
+    draft_model._draft_logits_log = None
+    if not log:
+        return None
+    logits = mx.concatenate(log, axis=0) if len(log) > 1 else log[0]
+    if logits.ndim != 3 or logits.shape[0] != rows or logits.shape[1] != count:
+        return None
+    return logits
+
+
+def begin_draft_logits(draft_model, sampler: Callable, greedy: bool) -> None:
+    if (
+        not greedy
+        and getattr(draft_model, "records_draft_logits", False)
+        and _rejection_enabled()
+        and _rejection_params(sampler) is not None
+    ):
+        draft_model._draft_logits_log = []
+    else:
+        draft_model._draft_logits_log = None
+
+
+def _rejection_dflash_target_walk(
+    logits: mx.array,
+    draft_tokens: mx.array,
+    draft_logits: mx.array,
+    params: Tuple[float, float, int],
+    budgets: List[int],
+    *,
+    row_ids: List[int],
+    base_positions: List[int],
+    seed: Optional[int] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    temperature, top_p, top_k = params
+    batch, length, vocab = logits.shape
+    count = int(draft_tokens.shape[1])
+    p = _filtered_logprobs(logits, temperature, top_p, top_k)  # [B, L, V]
+    q = draft_logits
+    if q.shape[-1] < vocab:
+        pad = mx.full((*q.shape[:-1], vocab - q.shape[-1]), -mx.inf, q.dtype)
+        q = mx.concatenate([q, pad], axis=-1)
+    elif q.shape[-1] > vocab:
+        q = q[..., :vocab]
+    q = _filtered_logprobs(q, temperature, top_p, top_k)  # [B, count, V]
+
+    fallback_lp = p
+    if count:
+        ids = draft_tokens.astype(mx.int32)[..., None]
+        p_x = mx.exp(mx.take_along_axis(p[:, :count], ids, axis=-1)[..., 0])
+        q_x = mx.exp(mx.take_along_axis(q, ids, axis=-1)[..., 0])
+        if seed is None:
+            u = mx.random.uniform(shape=(batch, count))
+        else:
+            keys = _round_keys(seed, _ACCEPT_SALT, row_ids, base_positions, count)
+            u = mx.vmap(lambda k: mx.random.uniform(key=k))(keys).reshape(batch, count)
+        accept = u * q_x < p_x
+        residual = mx.maximum(mx.exp(p[:, :count]) - mx.exp(q), 0.0)
+        mass = residual.sum(axis=-1, keepdims=True)
+        residual_lp = mx.where(
+            mass > 0,
+            mx.log(residual) - mx.log(mx.maximum(mass, 1e-30)),
+            p[:, :count],
+        )
+        fallback_lp = mx.concatenate([residual_lp, p[:, count:]], axis=1)
+    flat = fallback_lp.reshape(batch * length, vocab)
+    if seed is None:
+        fallback = mx.random.categorical(flat)
+    else:
+        keys = _round_keys(seed, _RESIDUAL_SALT, row_ids, base_positions, length)
+        fallback = mx.vmap(lambda lp, k: mx.random.categorical(lp, key=k))(flat, keys)
+    fallback = fallback.reshape(batch, length)
+    if count:
+        mx.eval(accept, fallback)
+        accept_rows = accept.tolist()
+    else:
+        mx.eval(fallback)
+        accept_rows = [[] for _ in range(batch)]
+    draft_rows = draft_tokens.tolist()
+    fallback_rows = fallback.tolist()
+
+    accepted, new_tokens = [], []
+    for row, budget in enumerate(budgets):
+        n = 0
+        while n < count and accept_rows[row][n]:
+            n += 1
+        tokens = draft_rows[row][:n]
+        if n < length and len(tokens) < budget:
+            tokens.append(int(fallback_rows[row][n]))
+        accepted.append(n)
+        new_tokens.append(tokens[:budget])
+    return accepted, new_tokens
+
+
 def _sample_dflash_target_walk(
     logits: mx.array,
     draft_tokens: mx.array,
@@ -252,7 +423,20 @@ def _sample_dflash_target_walk(
     *,
     row_ids: List[int],
     base_positions: List[int],
+    draft_logits: Optional[mx.array] = None,
 ) -> Tuple[List[int], List[List[int]]]:
+    params = _rejection_params(sampler) if draft_logits is not None else None
+    if params is not None and _rejection_enabled():
+        return _rejection_dflash_target_walk(
+            logits,
+            draft_tokens,
+            draft_logits,
+            params,
+            budgets,
+            row_ids=row_ids,
+            base_positions=base_positions,
+            seed=getattr(sampler, "seed", None),
+        )
     if _supports_positioned_target_sampling(sampler):
         target_tokens = _sample_dflash_target_block(
             logits,
@@ -457,7 +641,11 @@ class DFlashBatch:
                 ]
             )
 
+        begin_draft_logits(self.draft, self.sampler, self.greedy)
         draft_tokens = self.sampler_rng.draft_tokens(draft_rows)
+        draft_logits = take_draft_logits(
+            self.draft, len(budgets), int(draft_tokens.shape[1])
+        )
         inputs = mx.concatenate(
             [mx.array(self.bonus, self.dtype)[:, None], draft_tokens], axis=1
         )
@@ -494,6 +682,7 @@ class DFlashBatch:
                     budgets,
                     row_ids=row_ids,
                     base_positions=positions,
+                    draft_logits=draft_logits,
                 )
                 self.sampler_rng.target_sampled(sync_draft=not self.positioned_sampling)
             # A clipped final round must never commit past the emitted prefix.
@@ -601,6 +790,7 @@ def _dflash_rounds(
             if greedy_sampling
             else draft_model.draft_block
         )
+        begin_draft_logits(draft_model, sampler, greedy_sampling)
         draft_tokens = sampler_rng.draft_tokens(
             draft_fn,
             b,
@@ -651,6 +841,9 @@ def _dflash_rounds(
                     [max_tokens - emitted],
                     row_ids=[0],
                     base_positions=[emitted],
+                    draft_logits=take_draft_logits(
+                        draft_model, 1, int(draft_tokens.shape[1])
+                    ),
                 )
                 accepted = accepted_list[0]
                 new_tokens = new_tokens_list[0]
@@ -828,7 +1021,11 @@ def _dflash_rounds_batch(
         # Keep draft collectives on the verifier stream so distributed ranks
         # cannot submit draft and target reductions in different orders.
         with mx.stream(generation_stream):
+            begin_draft_logits(draft_model, sampler, greedy_sampling)
             draft_tokens = sampler_rng.draft_tokens(draft_active_rows)
+            draft_logits = take_draft_logits(
+                draft_model, n_active, int(draft_tokens.shape[1])
+            )
 
         gdn_states = None
         try:
@@ -866,6 +1063,7 @@ def _dflash_rounds_batch(
                     budgets,
                     row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
                     base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                    draft_logits=draft_logits,
                 )
                 sampler_rng.target_sampled(sync_draft=not positioned_sampling)
 

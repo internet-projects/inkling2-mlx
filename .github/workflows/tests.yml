@@ -149,6 +149,7 @@ jobs:
               tests/test_inkling2_prefill_glue.py
               tests/test_processors.py
               tests/test_speculative.py
+              tests/test_dspark_rejection.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
             os: macos-15
