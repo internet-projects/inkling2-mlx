@@ -162,3 +162,27 @@ remains slower than baseline on the measured M3 Ultra workloads; use ordinary
 decode when throughput is the priority. Text prefill remains chunked with the
 drafter attached; captured features are retained across chunks. Image spans
 still use the model's whole-image prefill policy.
+
+## Sampled acceptance
+
+With `temperature > 0`, a drafter that sets `records_draft_logits` (the Inkling 2
+DSpark head does) keeps the logits it drew each proposal from. The target then
+checks the drafts with speculative (rejection) sampling: a drafted token `x` is
+kept with probability `min(1, p(x) / q(x))`, where `p` and `q` are the target's
+and the drafter's distributions after the same temperature, top-k and top-p
+filters, and the first rejected position is drawn from the normalized residual
+`max(0, p - q)`. The committed tokens follow the target's filtered distribution
+exactly, and a round keeps `1 - TV(p, q)` of its drafts on average, instead of
+only the drafts that the target's own random draw happens to repeat.
+
+`generate()` without a seed gives such a drafter a positioned sampler with a run
+seed drawn from `mx.random`, so `mx.random.seed` still makes runs reproducible.
+With a seed, output follows the same distribution as drafter-free sampling but is
+not token-identical to it. `MLX_VLM_DSPARK_REJECTION=0` restores the previous
+check, which is. Samplers with top-n-sigma, p-less or typical-p filters keep the
+previous check.
+
+On an M5 Max with the Inkling 2 Mini 4-bit build (DSpark block 4, 256 tokens),
+a rewrite at temperature 1.0 went from 92.9 to 97.4 tok/s (plain decode 83.3),
+and with top-p 0.95 from 76.6 to 96.6 tok/s (plain 82.0). Ordinary chat stays
+faster with plain decode.
