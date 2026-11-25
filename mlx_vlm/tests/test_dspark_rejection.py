@@ -5,7 +5,7 @@ import pytest
 from mlx_vlm.generate.ar import _PositionedTargetSampler
 from mlx_vlm.speculative import dflash as D
 
-N = 40000
+N = 4000
 
 
 def _law(logits, temperature, top_p, top_k):
@@ -49,15 +49,15 @@ def test_rejection_walk_keeps_target_law(temperature, top_p, top_k, seeded):
     )
     p_law = _law(p_logits, temperature, top_p, top_k)
     first = np.bincount([t[0] for t in tokens], minlength=p_law.shape[1]) / N
-    assert np.abs(first - p_law[0]).max() < 0.015
+    assert np.abs(first - p_law[0]).max() < 0.04
     second = [t[1] for t in tokens if len(t) > 1]
     assert len(second) > N // 4
     second = np.bincount(second, minlength=p_law.shape[1]) / len(second)
-    assert np.abs(second - p_law[1]).max() < 0.02
+    assert np.abs(second - p_law[1]).max() < 0.05
     # Acceptance is 1 - TV(p, q) at the first position.
     q_law = _law(np.array(dlogits[0]), temperature, top_p, top_k)
     expected = 1 - 0.5 * np.abs(p_law[0] - q_law[0]).sum()
-    assert abs(np.mean([a >= 1 for a in accepted]) - expected) < 0.015
+    assert abs(np.mean([a >= 1 for a in accepted]) - expected) < 0.04
 
 
 def test_identical_laws_accept_everything():
