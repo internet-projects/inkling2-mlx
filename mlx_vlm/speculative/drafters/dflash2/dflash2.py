@@ -209,6 +209,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.embed_scale = 1.0
         self.lm_head = lambda h: lm.lm_head(h)[..., :width]
         self.argmax_from_hidden = None
+        # Plain decode is faster than drafting on much of Inkling's chat; the
+        # round loop may switch drafting off while it does not pay.
+        self.supports_auto_off = True
         return self
 
     def draft_block_greedy(self, *args, **kwargs):

@@ -114,3 +114,22 @@ def test_published_config_loads():
     assert config.target_layer_ids == [5, 23, 41, 48]
     assert config.num_target_layers == 49  # 48 visits + the final-norm tap
     assert config.selector_softcap_mode == "after_correction"
+
+
+@pytest.mark.parametrize("seed", [41, None])
+def test_auto_off_switching_keeps_greedy_output(monkeypatch, seed):
+    from mlx_vlm.speculative import dflash as D
+    from mlx_vlm.tests.test_dspark_auto_off import _Always
+
+    target, draft, generated = _case()
+    plain = generated(target, None, temperature=0, seed=seed)
+    spans = []
+    real = D._plain_decode_block
+    monkeypatch.setattr(D, "_DraftAutoOff", _Always)
+    monkeypatch.setattr(
+        D, "_plain_decode_block", lambda *a, **k: spans.append(a[4]) or real(*a, **k)
+    )
+    got = generated(target, draft, temperature=0, seed=seed)
+    assert draft.supports_auto_off
+    assert got == plain
+    assert len(spans) >= 2 and draft.accept_lens
