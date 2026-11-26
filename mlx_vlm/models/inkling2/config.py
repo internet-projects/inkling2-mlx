@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -50,15 +51,42 @@ class TextConfig(BaseModelConfig):
     mlp_up_softcap: float = 25.0
     final_logit_softcapping: float = 30.0
     loop_config: LoopConfig | None = None
+    # Run-time pass count for variable-loop checkpoints (loop_config.is_varloop),
+    # as in Transformers and vLLM. None uses the checkpoint's num_passes. The
+    # INKLING2_LOOP_PASSES environment variable sets it for every entry point.
+    loop_num_passes: Optional[int] = None
 
     def __post_init__(self):
         if isinstance(self.loop_config, dict):
             self.loop_config = LoopConfig(**self.loop_config)
         loop = self.loop_config
+        env_passes = os.environ.get("INKLING2_LOOP_PASSES", "").strip()
+        if env_passes and loop is not None and loop.is_varloop:
+            try:
+                self.loop_num_passes = int(env_passes)
+            except ValueError:
+                raise ValueError(
+                    f"INKLING2_LOOP_PASSES must be an integer, got {env_passes!r}"
+                ) from None
         if loop is None:
             if self.model_type == "inkling2_loop_text":
                 raise ValueError("Inkling 2 Mini requires loop_config")
+            if self.loop_num_passes is not None:
+                raise ValueError("loop_num_passes needs a loop checkpoint")
             return
+        if not loop.is_varloop and self.loop_num_passes == loop.num_passes:
+            # Transformers writes its loop_num_passes next to loop_config.
+            self.loop_num_passes = None
+        if self.loop_num_passes is not None:
+            if not loop.is_varloop:
+                raise ValueError(
+                    "loop_num_passes needs a variable-loop checkpoint "
+                    "(loop_config.is_varloop=true)"
+                )
+            if type(self.loop_num_passes) is not int or self.loop_num_passes < 1:
+                raise ValueError(
+                    f"loop_num_passes must be at least 1, got {self.loop_num_passes}"
+                )
         if not (
             0 < loop.core_start < loop.core_end <= self.num_hidden_layers
             and self.n_layers_per_attn_res_block > 0
@@ -66,9 +94,18 @@ class TextConfig(BaseModelConfig):
             and loop.core_end % self.n_layers_per_attn_res_block == 0
             and loop.num_passes >= 1
             and loop.gate_rank >= 1
-            and not loop.is_varloop
         ):
             raise ValueError(f"Unsupported Inkling 2 loop_config: {loop}")
+
+    @property
+    def num_loop_passes(self):
+        """Passes over the core layers used at run time (1 without a loop)."""
+        loop = self.loop_config
+        if loop is None:
+            return 1
+        if self.loop_num_passes is not None:
+            return self.loop_num_passes
+        return loop.num_passes
 
     @property
     def layer_indices(self):
@@ -78,7 +115,7 @@ class TextConfig(BaseModelConfig):
             return indices
         return (
             indices[: loop.core_start]
-            + indices[loop.core_start : loop.core_end] * loop.num_passes
+            + indices[loop.core_start : loop.core_end] * self.num_loop_passes
             + indices[loop.core_end :]
         )
 

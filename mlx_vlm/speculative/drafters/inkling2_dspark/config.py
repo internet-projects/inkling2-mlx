@@ -61,6 +61,17 @@ class ModelConfig(BaseModelConfig):
             or any(i < 0 or i >= self.num_hidden_layers for i in self.local_layer_ids)
         ):
             raise ValueError("Unsupported Inkling 2 mtp_config")
+        text_cfg = self.text_config
+        if (
+            text_cfg.loop_config is not None
+            and text_cfg.num_loop_passes != text_cfg.loop_config.num_passes
+        ):
+            raise ValueError(
+                "The Inkling 2 MTP/DSpark drafter was trained with "
+                f"{text_cfg.loop_config.num_passes} loop passes; it cannot draft "
+                f"for {text_cfg.num_loop_passes} passes. Run without the drafter "
+                "or with the checkpoint's pass count."
+            )
         ids = self.target_layer_ids
         if (
             len(ids) < 2
