@@ -194,6 +194,7 @@ class Model(nn.Module):
     prefer_requested_block_size = True
     # Sampled rounds keep the draft logits for speculative (rejection) sampling.
     records_draft_logits = True
+    supports_auto_off = True
 
     def __init__(self, config: ModelConfig):
         super().__init__()

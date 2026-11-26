@@ -1,5 +1,6 @@
 import copy
 import os
+import time
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -765,7 +766,45 @@ def _dflash_rounds(
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
 
+    auto = None
+    if (
+        _auto_off_enabled()
+        and getattr(draft_model, "supports_auto_off", False)
+        and not hidden_is_prepared
+        and thinking_budget_criteria is None
+        and (greedy_sampling or positioned_sampling)
+    ):
+        auto = _DraftAutoOff()
+    round_start = time.perf_counter()
+
     while emitted < max_tokens:
+        if auto is not None:
+            span = auto.plain_span(emitted, max_tokens)
+            if span:
+                block = _plain_decode_block(
+                    lm,
+                    prompt_cache,
+                    b,
+                    hidden,
+                    span,
+                    target_layer_ids,
+                    sampler,
+                    greedy_sampling,
+                    emitted,
+                    token_dtype,
+                )
+                count = 0
+                for tok in block.tokens():
+                    yield tok, None
+                    emitted += 1
+                    count += 1
+                    if emitted >= max_tokens:
+                        return
+                b, hidden = block.last, block.hidden()
+                auto.plain_done(*block.timing())
+                round_start = time.perf_counter()
+                continue
+
         bs = _dflash_next_block_size(
             draft_model,
             block_total,
@@ -875,8 +914,148 @@ def _dflash_rounds(
             emitted += 1
             if emitted >= max_tokens:
                 return
+        if auto is not None:
+            now = time.perf_counter()
+            auto.spec_done(len(new_tokens), now - round_start)
+            round_start = now
 
         verify_out = None
+
+
+_AUTO_OFF_ENV = "MLX_VLM_DSPARK_AUTO_OFF"
+
+
+def _auto_off_enabled() -> bool:
+    return os.environ.get(_AUTO_OFF_ENV, "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+class _DraftAutoOff:
+    """Turn drafting off while plain decode is faster, from on-line timings.
+
+    Both rates are tokens per wall second, measured the same way (including the
+    caller's per-token work). Drafting starts on; after ``WARM`` tokens and
+    ``SPEC_ROUNDS`` timed rounds a short plain span measures plain decode. While
+    plain is faster, plain spans grow (``SPAN`` doubling up to ``SPAN_MAX``
+    tokens) with ``PROBE`` drafting rounds between them, judged on those rounds
+    alone, so a stretch where drafting pays (code, a rewrite) turns it back on.
+    Drafting is judged on its last ``WINDOW`` rounds.
+    """
+
+    WARM = 32
+    SPEC_ROUNDS = 4
+    PROBE = 3
+    WINDOW = 6
+    FIRST = 16
+    SPAN = 32
+    SPAN_MAX = 256
+    MARGIN = 0.97
+
+    def __init__(self):
+        self.rounds = []  # (tokens, seconds) since the last plain span
+        self.plain_rate = None
+        self.span = self.SPAN
+        self.skipped_first = False
+
+    def spec_done(self, tokens, seconds):
+        if not self.skipped_first:  # the first round includes compile time
+            self.skipped_first = True
+            return
+        self.rounds.append((int(tokens), float(seconds)))
+        del self.rounds[: -self.WINDOW]
+
+    def spec_rate(self):
+        seconds = sum(r[1] for r in self.rounds)
+        return sum(r[0] for r in self.rounds) / seconds if seconds > 0 else None
+
+    def plain_span(self, emitted, max_tokens):
+        left = max_tokens - emitted
+        if left < 8 or emitted < self.WARM:
+            return 0
+        need = self.SPEC_ROUNDS if self.plain_rate is None else self.PROBE
+        if len(self.rounds) < need:
+            return 0
+        if self.plain_rate is None:
+            return min(self.FIRST, left)
+        rate = self.spec_rate()
+        if rate >= self.plain_rate * self.MARGIN:
+            self.span = self.SPAN
+            return 0
+        span = min(self.span, left)
+        self.span = min(self.span * 2, self.SPAN_MAX)
+        return span
+
+    def plain_done(self, tokens, seconds):
+        if tokens > 1 and seconds > 0:
+            rate = tokens / seconds
+            self.plain_rate = (
+                rate if self.plain_rate is None else 0.5 * (self.plain_rate + rate)
+            )
+        self.rounds = []
+
+
+class _plain_decode_block:
+    """Plain one-token target steps (pipelined one step ahead), keeping the
+    drafter's captures for every token so drafting can resume afterwards."""
+
+    def __init__(
+        self, lm, cache, bonus, hidden, count, taps, sampler, greedy, emitted, dtype
+    ):
+        self.lm, self.cache, self.taps = lm, cache, taps
+        self.sampler, self.greedy, self.dtype = sampler, greedy, dtype
+        self.count, self.position = int(count), int(emitted)
+        self.captures = [hidden]
+        self.last = int(bonus)
+        self._first = mx.array([[int(bonus)]], dtype)
+        self.t_first = self.t_last = None
+        self.done = 0
+
+    def timing(self):
+        """(tokens, seconds) after the first token, or (0, 0.0)."""
+        if self.done < 2:
+            return 0, 0.0
+        return self.done - 1, self.t_last - self.t_first
+
+    def _step(self, token, position):
+        with mx.stream(generation_stream):
+            out = self.lm(token, cache=self.cache, capture_layer_ids=self.taps)
+            logits = out.logits[:, -1]
+            if self.greedy:
+                nxt = mx.argmax(logits, axis=-1)
+            else:
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                nxt = self.sampler.sample_target(
+                    logprobs, row_ids=[0], positions=[position]
+                )
+            nxt = nxt.reshape(1, 1).astype(self.dtype)
+            captured = mx.concatenate(out.hidden_states, axis=-1)
+        mx.async_eval(nxt, captured)
+        return nxt, captured
+
+    def tokens(self):
+        cur, cap = self._step(self._first, self.position)
+        for i in range(self.count):
+            ahead = None
+            if i + 1 < self.count:
+                ahead = self._step(cur, self.position + i + 1)
+            tok = int(cur.item())
+            now = time.perf_counter()
+            if self.t_first is None:
+                self.t_first = now  # the first step may include kernel compiles
+            self.t_last, self.done = now, i + 1
+            self.captures.append(cap)
+            self.last = tok
+            yield tok
+            if ahead is None:
+                break
+            cur, cap = ahead
+
+    def hidden(self):
+        return mx.concatenate(self.captures, axis=1)
 
 
 def _dflash_rounds_batch(
