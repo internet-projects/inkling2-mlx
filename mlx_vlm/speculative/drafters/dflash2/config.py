@@ -27,6 +27,9 @@ class DFlash2Config(DFlashConfig):
     selector_top_k: int = 0
     is_causal: bool = False
     no_rope_layers: list[int] = field(default_factory=list)
+    # "after_correction": score = softcap(logit + edge) (Inkling 2 Mini's draft,
+    # as its sglang adapter ships it); None softcaps the logits first.
+    selector_softcap_mode: str | None = None
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -126,6 +129,7 @@ class DFlash2Config(DFlashConfig):
             "conv_group_size",
             "selector_rank",
             "selector_top_k",
+            "selector_softcap_mode",
         ):
             if key in dflash:
                 flat[key] = dflash[key]
@@ -137,6 +141,10 @@ class DFlash2Config(DFlashConfig):
                 flat["rope_theta"] = rope_parameters.pop("rope_theta")
             flat["rope_scaling"] = rope_parameters
 
+        if "num_target_layers" not in flat and flat.get("target_layer_ids"):
+            # Inkling 2 Mini's draft taps loop visits; its last tap (= the visit
+            # count) is the final norm's output.
+            flat["num_target_layers"] = max(flat["target_layer_ids"]) + 1
         if "runtime_block_size" not in flat:
             flat["runtime_block_size"] = min(5, int(flat["block_size"]))
 

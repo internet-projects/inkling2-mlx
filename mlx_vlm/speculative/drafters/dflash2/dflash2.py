@@ -112,6 +112,11 @@ class CandidateSelector(nn.Module):
     def __init__(self, config: DFlash2Config):
         super().__init__()
         self.top_k = config.selector_top_k
+        self.softcap = (
+            config.final_logit_softcapping
+            if config.selector_softcap_mode == "after_correction"
+            else None
+        )
         self.predecessor_codebook = nn.Embedding(
             config.vocab_size, config.selector_rank
         )
@@ -141,6 +146,8 @@ class CandidateSelector(nn.Module):
                 axis=-1,
             )
             scores = unary[:, position] + edges
+            if self.softcap:
+                scores = mx.tanh(scores / self.softcap) * self.softcap
             selected = (
                 sample_proposal(scores)
                 if callable(sample_proposal)
@@ -151,6 +158,14 @@ class CandidateSelector(nn.Module):
             )[:, 0]
             path.append(predecessor)
         return mx.stack(path, axis=1)
+
+
+def _inkling_target(target_model):
+    lm = getattr(target_model, "language_model", target_model)
+    cfg = getattr(lm, "config", None)
+    if getattr(cfg, "model_type", None) in ("inkling2_text", "inkling2_loop_text"):
+        return lm
+    return None
 
 
 class DFlash2DraftModel(DFlashDraftModel):
@@ -164,12 +179,47 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.candidate_selector = CandidateSelector(config)
 
     def validate_target_compatibility(self, target_model) -> None:
-        validate_dflash_target(self.config, target_model, "DFlash2")
+        lm = _inkling_target(target_model)
+        if lm is None:
+            validate_dflash_target(self.config, target_model, "DFlash2")
+            return
+        cfg = lm.config
+        visits = len(getattr(lm.model, "layer_indices", ()))
+        ids = list(self.config.target_layer_ids)
+        if (
+            cfg.hidden_size != self.config.hidden_size
+            or cfg.vocab_size != self.config.vocab_size
+            or not visits
+            or ids[-1] != visits
+            or not hasattr(lm, "rollback_speculative_cache")
+        ):
+            raise ValueError("This DFlash2 draft does not match the Inkling 2 target.")
 
     def bind(self, target_model) -> "DFlash2DraftModel":
         self.validate_target_compatibility(target_model)
-        super().bind(target_model)
+        lm = _inkling_target(target_model)
+        if lm is None:
+            super().bind(target_model)
+            return self
+        # Inkling 2: the anchor and mask rows are the target's NORMED embedding,
+        # the block rows go through the target's raw head (its softcap is the
+        # selector's, after the edge correction), over the real vocabulary.
+        width = int(lm.config.unpadded_vocab_size)
+        self.embed_tokens = lm.model.embed
+        self.embed_scale = 1.0
+        self.lm_head = lambda h: lm.lm_head(h)[..., :width]
+        self.argmax_from_hidden = None
         return self
+
+    def draft_block_greedy(self, *args, **kwargs):
+        # The selector chains the path; the target's plain argmax must not
+        # replace it.
+        return self.draft_block(*args, **kwargs)
+
+    def _selector_logits(self, hidden: mx.array) -> mx.array:
+        if self.candidate_selector.softcap:
+            return self.lm_head(hidden) * self.config.output_multiplier
+        return self._logits(hidden)
 
     def _embed_input_tokens(self, inputs: mx.array) -> mx.array:
         return (
@@ -222,7 +272,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         x = self.norm(x)[:, 1:]
         return self.candidate_selector.select(
-            x, self._logits(x), anchor, sampler
+            x, self._selector_logits(x), anchor, sampler
         ).astype(token_dtype)
 
     def draft_block(
@@ -252,7 +302,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         draft_hidden = self._hidden(draft_inputs, hidden, cache)[:, 1:]
         return self.candidate_selector.select(
             draft_hidden,
-            self._logits(draft_hidden),
+            self._selector_logits(draft_hidden),
             anchor,
             sampler,
         ).astype(token_dtype)
