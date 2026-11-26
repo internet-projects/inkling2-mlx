@@ -152,3 +152,134 @@ def test_own_layout_untouched():
     assert _is_mlx_lm_layout(
         {"language_model.model.layers.1.q_message_gate.down_proj.weight": 0}
     )
+
+
+def _to_omlx(weights, sliding):
+    """oMLX (oQ) layout: stacked attention rows, packed loop controllers."""
+    out, layers = {}, {}
+    for key, value in weights.items():
+        if key.startswith("language_model.model.layers."):
+            idx, rest = key[len("language_model.model.layers.") :].split(".", 1)
+            layers.setdefault(int(idx), {})[rest] = value
+        elif key == "language_model.model.message_queries":
+            queries = value
+        elif key.startswith("language_model.model.embed_tokens."):
+            out["model.embed." + key.rsplit(".", 1)[1]] = value
+        elif key == "language_model.model.final_input.query":
+            out["model.final_input.query"] = value.reshape(-1, value.shape[-1])
+        elif key.startswith("language_model."):
+            out[key[len("language_model.") :]] = value
+        elif key.startswith("vision_tower."):
+            sub = key[len("vision_tower.") :]
+            for new, old in (
+                ("ln_pre.", "pre_layernorm."),
+                (".ln_1.", ".layernorm_before."),
+                (".ln_2.", ".layernorm_after."),
+                (".ls_1.gamma", ".lambda_1"),
+                (".ls_2.gamma", ".lambda_2"),
+                (".mlp.c_fc.", ".mlp.fc1."),
+                (".mlp.c_proj.", ".mlp.fc2."),
+            ):
+                sub = sub.replace(old, new)
+            if not sub.startswith(("proj_in", "proj_out")):
+                sub = "backbone." + sub
+            out["vision_tower." + sub] = value
+    core = []
+    for idx, d in sorted(layers.items()):
+        pre = f"model.layers.{idx}."
+        a = "self_attn."
+
+        def stack(dst, names):
+            for s in ("weight", "scales", "biases"):
+                parts = [d.pop(f"{a}{n}.{s}") for n in names if f"{a}{n}.{s}" in d]
+                if parts:
+                    out[f"{pre}attn.{dst}.{s}"] = mx.concatenate(parts, axis=0)
+
+        if idx in sliding:
+            stack("in_proj", ["q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj"])
+            for n in ("k", "v"):
+                out[pre + f"attn.{n}_conv"] = d.pop(f"{a}{n}_sconv.conv.weight")[..., 0]
+            out[pre + "attn_norm.weight"] = d.pop("input_layernorm.weight")
+        else:
+            stack("q_proj", ["q_proj", "r_proj", "gate_proj", "sink_proj"])
+            for n in ("k", "v"):
+                stack(f"{n}_proj", [f"{n}_proj", f"{n}_sconv.weight_proj"])
+                out[pre + f"attn.{n}_static"] = d.pop(f"{a}{n}_sconv.static_weight")
+            for n in ("q", "k", "v"):
+                out[pre + f"{n}_input_norm.weight"] = d.pop(f"{n}_input_layernorm.weight")
+        stack("o_proj", ["o_proj"])
+        out[pre + "attn.q_scale"] = d.pop(a + "q_scale")
+        out[pre + "attn.r_scale"] = d.pop(a + "rel_scale")
+        out[pre + "attn.rel_proj"] = d.pop(a + "rel_proj")
+        out[pre + "attn_conv"] = d.pop("attn_sconv.conv.weight")[..., 0]
+        out[pre + "mlp_conv"] = d.pop("mlp_sconv.conv.weight")[..., 0]
+        out[pre + "mlp_norm.weight"] = d.pop("post_attention_layernorm.weight")
+        out[pre + "mlp.router_weight"] = d.pop("mlp.gate_weight")
+        out[pre + "mlp.router_bias"] = d.pop("mlp.e_score_correction_bias")
+        for src, dst in (("attention_input", "attn_input"), ("mlp_input", "mlp_input")):
+            if f"{src}.query" in d:
+                q = d.pop(f"{src}.query")
+                out[pre + f"{dst}.query"] = q.reshape(-1, q.shape[-1])
+        sw = "mlp.switch_mlp."
+        for s in ("weight", "scales", "biases"):
+            if f"{sw}gate_proj.{s}" in d:
+                g, u = d.pop(f"{sw}gate_proj.{s}"), d.pop(f"{sw}up_proj.{s}")
+                out[pre + "mlp.experts.w13." + s] = mx.stack([g, u], axis=-2).reshape(
+                    *g.shape[:-2], -1, g.shape[-1]
+                )
+                out[pre + "mlp.experts.w2." + s] = d.pop(f"{sw}down_proj.{s}")
+        if "controllers.attn.down_weight" in d:
+            downs, gates = [], []
+            for m in ("attn", "k", "v", "mlp"):
+                down = d.pop(f"controllers.{m}.down_weight")
+                rank = down.shape[0]
+                downs.append(down.reshape(rank, 2, -1).transpose(1, 2, 0))
+                gain = d.pop(f"controllers.{m}.gain_weight")
+                forget = d.pop(f"controllers.{m}.forget_weight")
+                gates.append(mx.concatenate([gain.T, forget.T], axis=1))
+            out[pre + "loop_down"] = mx.stack(downs)
+            out[pre + "loop_gain_forget"] = mx.stack(gates)
+            core.append(idx)
+        assert not d, sorted(d)
+    for i, idx in enumerate(core):
+        out[f"model.layers.{idx}.loop_message.query"] = queries[i]
+    return out
+
+
+@pytest.mark.parametrize("quantize", [False, True])
+def test_omlx_layout_loads_same_output(tmp_path, quantize):
+    model, config = _mini(False)
+    if quantize:
+        # oQ: experts NVFP4 / MXFP8, attention and head 8-bit affine.
+        def predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            if ".switch_mlp." in path:
+                layer = int(path.split(".layers.")[1].split(".")[0])
+                if layer < 2:
+                    return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+                return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            if path.startswith("language_model.") and (
+                ".self_attn." in path or path.endswith(("lm_head", "embed_tokens"))
+            ):
+                return {"group_size": 32, "bits": 8, "mode": "affine"}
+            return False
+
+        nn.quantize(model, class_predicate=predicate)
+    weights = dict(tree_flatten(model.parameters()))
+    sliding = set(config["text_config"]["local_layer_ids"])
+    foreign = _to_omlx(weights, sliding)
+    assert "model.embed.weight" in foreign
+    config["quantization"] = {"group_size": 64, "bits": 4, "mode": "affine"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), foreign)
+
+    loaded = load_model(tmp_path)
+    got = dict(tree_flatten(loaded.parameters()))
+    assert set(got) == set(weights)
+    for key, value in weights.items():
+        assert mx.array_equal(got[key], value).item(), key
+    ids = mx.array([[1, 5, 9, 2, 7, 3]])
+    assert mx.array_equal(
+        loaded.language_model(ids).logits, model.language_model(ids).logits
+    ).item()

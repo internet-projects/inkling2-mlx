@@ -2,6 +2,7 @@ import re
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from ..base import InputEmbeddingsFeatures
 from ..inkling.inkling import _split_gate_up, _to_mlx_conv, masked_scatter
@@ -79,6 +80,40 @@ def _infer_quantization(path, weight, scales, in_dims):
         if mode is None:
             raise ValueError(f"Unknown packed format for {path}: {bits}/{group_size}")
     return {"group_size": group_size, "bits": bits, "mode": mode}
+
+
+_OMLX_SLIDING_IN_PROJ = ("q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj")
+_OMLX_GLOBAL_Q_PROJ = ("q_proj", "r_proj", "gate_proj", "sink_proj")
+_OMLX_LOOP_INPUTS = ("attn", "k", "v", "mlp")
+_OMLX_VISION_RENAMES = (
+    ("ln_pre.", "pre_layernorm."),
+    (".ln_1.", ".layernorm_before."),
+    (".ln_2.", ".layernorm_after."),
+    (".ls_1.gamma", ".lambda_1"),
+    (".ls_2.gamma", ".lambda_2"),
+    (".mlp.c_fc.", ".mlp.fc1."),
+    (".mlp.c_proj.", ".mlp.fc2."),
+)
+
+
+def _is_omlx_layout(weights):
+    return "model.embed.weight" in weights or any(
+        k.startswith("model.layers.") and ".attn." in k for k in weights
+    )
+
+
+def _split_rows(tensors, prefix, names, sizes, out):
+    """Split stacked output rows of one (quantized) linear into its parts."""
+    for suffix in ("weight", "scales", "biases"):
+        value = tensors.pop(f"{prefix}.{suffix}", None)
+        if value is None:
+            continue
+        start = 0
+        for name, size in zip(names, sizes):
+            out[f"{name}.{suffix}"] = value[start : start + size]
+            start += size
+        if start != value.shape[0]:
+            raise ValueError(f"{prefix}: {value.shape[0]} rows, parts sum to {start}")
 
 
 class Model(nn.Module):
@@ -190,7 +225,108 @@ class Model(nn.Module):
             )
         )
 
+    def _from_omlx_layout(self, weights):
+        """Map an oMLX (oQ) Inkling 2 checkpoint to this model's names."""
+        modules = dict(self.named_modules())
+        shapes = {k: v.shape for k, v in tree_flatten(self.parameters())}
+
+        def rows(path):
+            return modules[path].weight.shape[0]
+
+        out, layers, messages = {}, {}, {}
+        for key, value in weights.items():
+            if key.startswith(("mtp.", "model.mtp.")):
+                continue
+            if key.startswith("model.layers."):
+                idx, rest = key[len("model.layers.") :].split(".", 1)
+                layers.setdefault(int(idx), {})[rest] = value
+            elif key.startswith("vision_tower."):
+                sub = key[len("vision_tower.") :].removeprefix("backbone.")
+                for old, new in _OMLX_VISION_RENAMES:
+                    sub = sub.replace(old, new)
+                out["vision_tower." + sub] = value
+            elif key.startswith("lm_head."):
+                out["language_model." + key] = value
+            elif key.startswith("model.embed."):
+                out["language_model.model.embed_tokens." + key[12:]] = value
+            elif key == "model.final_input.query":
+                target = "language_model.model.final_input.query"
+                out[target] = value.reshape(shapes[target])
+            else:
+                out["language_model." + key] = value
+        for idx, d in sorted(layers.items()):
+            base = f"language_model.model.layers.{idx}."
+            a = base + "self_attn."
+            if "attn.in_proj.weight" in d:
+                names = [a + n for n in _OMLX_SLIDING_IN_PROJ]
+                _split_rows(d, "attn.in_proj", names, [rows(n) for n in names], out)
+                for n in ("k", "v"):
+                    out[a + f"{n}_sconv.conv.weight"] = d.pop(f"attn.{n}_conv")[..., None]
+                out[base + "input_layernorm.weight"] = d.pop("attn_norm.weight")
+            else:
+                names = [a + n for n in _OMLX_GLOBAL_Q_PROJ]
+                _split_rows(d, "attn.q_proj", names, [rows(n) for n in names], out)
+                for n in ("k", "v"):
+                    names = [a + f"{n}_proj", a + f"{n}_sconv.weight_proj"]
+                    _split_rows(d, f"attn.{n}_proj", names, [rows(n) for n in names], out)
+                    out[a + f"{n}_sconv.static_weight"] = d.pop(f"attn.{n}_static")
+                for n in ("q", "k", "v"):
+                    out[base + f"{n}_input_layernorm.weight"] = d.pop(
+                        f"{n}_input_norm.weight"
+                    )
+            for suffix in ("weight", "scales", "biases"):
+                if f"attn.o_proj.{suffix}" in d:
+                    out[a + "o_proj." + suffix] = d.pop(f"attn.o_proj.{suffix}")
+            out[a + "q_scale"] = d.pop("attn.q_scale")
+            out[a + "rel_scale"] = d.pop("attn.r_scale")
+            out[a + "rel_proj"] = d.pop("attn.rel_proj")
+            out[base + "attn_sconv.conv.weight"] = d.pop("attn_conv")[..., None]
+            out[base + "mlp_sconv.conv.weight"] = d.pop("mlp_conv")[..., None]
+            out[base + "post_attention_layernorm.weight"] = d.pop("mlp_norm.weight")
+            out[base + "mlp.gate_weight"] = d.pop("mlp.router_weight")
+            out[base + "mlp.e_score_correction_bias"] = d.pop("mlp.router_bias")
+            for src, dst in (("attn_input", "attention_input"), ("mlp_input", "mlp_input")):
+                if f"{src}.query" in d:
+                    target = base + f"{dst}.query"
+                    out[target] = d.pop(f"{src}.query").reshape(shapes[target])
+            sw = base + "mlp.switch_mlp."
+            for suffix in ("weight", "scales", "biases"):
+                if f"mlp.experts.w13.{suffix}" in d:
+                    g, u = _split_gate_up(d.pop(f"mlp.experts.w13.{suffix}"))
+                    out[sw + "gate_proj." + suffix], out[sw + "up_proj." + suffix] = g, u
+                if f"mlp.experts.w2.{suffix}" in d:
+                    out[sw + "down_proj." + suffix] = d.pop(f"mlp.experts.w2.{suffix}")
+            for which, names in (("w13", ("gate_proj", "up_proj")), ("w2", ("down_proj",))):
+                gs = d.pop(f"mlp.experts.{which}.global_scale", None)
+                if gs is not None:
+                    for n in names:
+                        out[sw + n + ".weight_scale_2"] = (
+                            gs.astype(mx.float32) * _NVFP4_GLOBAL_TO_SCALE_2
+                        )
+            if "loop_down" in d:
+                down, gain_forget = d.pop("loop_down"), d.pop("loop_gain_forget")
+                width = down.shape[2]
+                for i, m in enumerate(_OMLX_LOOP_INPUTS):
+                    c = base + f"controllers.{m}."
+                    out[c + "down_weight"] = down[i].transpose(2, 0, 1).reshape(
+                        down.shape[3], -1
+                    )
+                    out[c + "gain_weight"] = gain_forget[i][:, :width].T
+                    out[c + "forget_weight"] = gain_forget[i][:, width:].T
+            if "loop_message.query" in d:
+                messages[idx] = d.pop("loop_message.query")
+            if d:
+                raise ValueError(f"Unmapped oMLX Inkling 2 tensors in layer {idx}: {sorted(d)}")
+        if messages:
+            out["language_model.model.message_queries"] = mx.stack(
+                [messages[i] for i in sorted(messages)]
+            )
+        return out
+
     def sanitize(self, weights):
+        if _is_omlx_layout(weights):
+            self._layout_from_weights = True
+            return self._from_omlx_layout(weights)
         self._layout_from_weights = _is_mlx_lm_layout(weights)
         if self._layout_from_weights:
             return _from_mlx_lm_layout(weights)
