@@ -150,6 +150,7 @@ jobs:
               tests/test_inkling2_other_builds.py
               tests/test_inkling2_dflash2.py
               tests/test_dspark_auto_off.py
+              tests/test_inkling2_varloop.py
               tests/test_processors.py
               tests/test_speculative.py
               tests/test_dspark_rejection.py
