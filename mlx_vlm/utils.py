@@ -645,6 +645,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     report("sanitizing_weights")
     weights = sanitize_weights(model, weights)
+    infer_quantization = getattr(model, "quantization_from_weights", None)
+    if infer_quantization is not None:
+        inferred = infer_quantization(weights, config.get("quantization"))
+        if inferred is not None:
+            config["quantization"] = config["quantization_config"] = inferred
 
     if hasattr(model_class, "VisionModel"):
         if hasattr(model_config, "vision_config"):

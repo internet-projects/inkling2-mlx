@@ -1,3 +1,5 @@
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -6,6 +8,77 @@ from ..inkling.inkling import _split_gate_up, _to_mlx_conv, masked_scatter
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+
+# mlx-lm (PR #2086) and nativ-community builds name tensors their own way.
+_MLX_LM_RENAMES = [
+    (r"^lm_head\.", "language_model.lm_head."),
+    (r"^model\.language_model\.", "language_model.model."),
+    (r"^model\.vision_tower\.", "vision_tower."),
+    (r"\.post_attention_convolution\.conv1d\.", ".attn_sconv.conv."),
+    (r"\.post_mlp_convolution\.conv1d\.", ".mlp_sconv.conv."),
+    (r"_sconv\.conv1d\.", "_sconv.conv."),
+    (r"\.self_attn\.q_l2_clip\.scale$", ".self_attn.q_scale"),
+    (r"\.self_attn\.rel_l2_clip\.scale$", ".self_attn.rel_scale"),
+    (r"\.self_attn\.rel_logits_proj\.proj$", ".self_attn.rel_proj"),
+    (r"\.mlp\.gate\.weight$", ".mlp.gate_weight"),
+    (r"\.mlp\.gate\.e_score_correction_bias$", ".mlp.e_score_correction_bias"),
+    (r"\.q_message_gate\.", ".controllers.attn."),
+    (r"\.(k|v|mlp)_message_gate\.", r".controllers.\1."),
+    (r"(\.controllers\.\w+)\.down_proj\.weight$", r"\1.down_weight"),
+    (r"(\.controllers\.\w+)\.forget_gate_proj\.weight$", r"\1.forget_weight"),
+    (r"(\.controllers\.\w+)\.message_gate_proj\.weight$", r"\1.gain_weight"),
+    (r"\.model\.message_input\.query$", ".model.message_queries"),
+    (r"\.mlp\.experts\.down_proj\.", ".mlp.switch_mlp.down_proj."),
+    (r"^vision_tower\.merger\.linear_1\.", "vision_tower.proj_in."),
+    (r"^vision_tower\.merger\.linear_2\.", "vision_tower.proj_out."),
+    (r"\.embeddings\.position_embedding\.weight$", ".embeddings.position_embedding"),
+]
+# mlx-lm stores the NVFP4 tensor scale times the E2M1 and E4M3 maxima.
+_NVFP4_GLOBAL_TO_SCALE_2 = 1.0 / (6.0 * 448.0)
+
+
+def _is_mlx_lm_layout(weights):
+    return any(
+        k.startswith(("model.language_model.", "lm_head."))
+        or "_message_gate." in k
+        or k.endswith("message_input.query")
+        for k in weights
+    )
+
+
+def _from_mlx_lm_layout(weights):
+    """Rename an mlx-lm style Inkling 2 checkpoint to this model's names."""
+    out = {}
+    for key, value in weights.items():
+        for pattern, replacement in _MLX_LM_RENAMES:
+            key = re.sub(pattern, replacement, key)
+        if key.endswith(".global_scale"):
+            key = key[: -len("global_scale")] + "weight_scale_2"
+            value = value.astype(mx.float32) * _NVFP4_GLOBAL_TO_SCALE_2
+        if ".mlp.experts.gate_up_proj." in key:
+            base, leaf = key.split(".mlp.experts.gate_up_proj.")
+            base += ".mlp.switch_mlp."
+            # The rows alternate between gate and up.
+            parts = (
+                (value, value) if leaf == "weight_scale_2" else _split_gate_up(value)
+            )
+            out[base + "gate_proj." + leaf], out[base + "up_proj." + leaf] = parts
+            continue
+        out[key] = value
+    return out
+
+
+def _infer_quantization(path, weight, scales, in_dims):
+    bits = weight.shape[-1] * 32 // in_dims
+    group_size = in_dims // scales.shape[-1]
+    mode = "affine"
+    if scales.dtype == mx.uint8:
+        mode = {(4, 16): "nvfp4", (4, 32): "mxfp4", (8, 32): "mxfp8"}.get(
+            (bits, group_size)
+        )
+        if mode is None:
+            raise ValueError(f"Unknown packed format for {path}: {bits}/{group_size}")
+    return {"group_size": group_size, "bits": bits, "mode": mode}
 
 
 class Model(nn.Module):
@@ -75,6 +148,33 @@ class Model(nn.Module):
                     ] = settings.copy()
         return result
 
+    def quantization_from_weights(self, weights, quantization):
+        """Per-module formats read from tensor shapes, for other builds.
+
+        mlx-lm style configs can understate the expert formats (NVFP4, MXFP8),
+        so the shapes are the reference.
+        """
+        if not getattr(self, "_layout_from_weights", False):
+            return None
+        modules = dict(self.named_modules())
+        base = {
+            k: v
+            for k, v in (quantization or {}).items()
+            if k in ("group_size", "bits", "mode")
+        } or {"group_size": 64, "bits": 4, "mode": "affine"}
+        result = dict(base)
+        for key, scales in weights.items():
+            if not key.endswith(".scales"):
+                continue
+            path = key[: -len(".scales")]
+            module = modules.get(path)
+            if module is None or not hasattr(module, "weight"):
+                continue
+            result[path] = _infer_quantization(
+                path, weights[path + ".weight"], scales, module.weight.shape[-1]
+            )
+        return result
+
     @staticmethod
     def cast_predicate(path):
         # Preserve the native FP32 queries, routing bias, and NVFP4 outer
@@ -91,6 +191,9 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        self._layout_from_weights = _is_mlx_lm_layout(weights)
+        if self._layout_from_weights:
+            return _from_mlx_lm_layout(weights)
         out, experts = {}, {}
         attn_names = {
             "wq_du": "q_proj",
