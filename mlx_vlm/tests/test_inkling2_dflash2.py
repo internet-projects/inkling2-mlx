@@ -90,3 +90,27 @@ def test_selector_softcap_after_correction():
     hidden = mx.zeros((1, 2, draft.config.hidden_size))
     path = sel.select(hidden, logits, mx.array([1]), lambda s: mx.argmax(s, -1))
     assert path.tolist() == [[5, 5]]
+
+
+PUBLISHED = {  # incoai/Inkling-2-Mini-DFlash2 config.json (as downloaded 2026-11-26)
+    "architectures": ["DFlash2DraftModel"], "attention_bias": False, "attention_dropout": 0.0,
+    "bos_token_id": None, "eos_token_id": None, "pad_token_id": None, "dtype": "bfloat16",
+    "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                      "final_logit_softcapping": 30.0, "mask_token_id": 200056, "selector_rank": 256,
+                      "selector_softcap_mode": "after_correction", "selector_top_k": 16,
+                      "target_layer_ids": [5, 23, 41, 48]},
+    "head_dim": 128, "hidden_act": "silu", "hidden_size": 2304, "initializer_range": 0.02,
+    "intermediate_size": 6912, "is_causal": False, "layer_types": ["sliding_attention"] * 5,
+    "max_position_embeddings": 1048576, "max_window_layers": 5, "model_type": "qwen3",
+    "num_attention_heads": 32, "num_hidden_layers": 5, "num_key_value_heads": 8,
+    "num_target_layers": 48, "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "sliding_window": 2048,
+    "tie_word_embeddings": False, "use_cache": False, "use_sliding_window": True, "vocab_size": 201024,
+}
+
+
+def test_published_config_loads():
+    config = DFlash2Config.from_dict(dict(PUBLISHED))
+    assert config.target_layer_ids == [5, 23, 41, 48]
+    assert config.num_target_layers == 49  # 48 visits + the final-norm tap
+    assert config.selector_softcap_mode == "after_correction"

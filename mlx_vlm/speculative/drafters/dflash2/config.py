@@ -141,10 +141,15 @@ class DFlash2Config(DFlashConfig):
                 flat["rope_theta"] = rope_parameters.pop("rope_theta")
             flat["rope_scaling"] = rope_parameters
 
-        if "num_target_layers" not in flat and flat.get("target_layer_ids"):
-            # Inkling 2 Mini's draft taps loop visits; its last tap (= the visit
-            # count) is the final norm's output.
-            flat["num_target_layers"] = max(flat["target_layer_ids"]) + 1
+        ids = flat.get("target_layer_ids")
+        if ids and (
+            "num_target_layers" not in flat
+            or max(ids) == flat["num_target_layers"]
+        ):
+            # Inkling 2 Mini's draft taps loop visits; a last tap equal to the
+            # visit count (as the published config writes it: 48 of 48) is the
+            # final norm's output, so the tap range is one wider.
+            flat["num_target_layers"] = max(ids) + 1
         if "runtime_block_size" not in flat:
             flat["runtime_block_size"] = min(5, int(flat["block_size"]))
 
