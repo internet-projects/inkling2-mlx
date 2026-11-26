@@ -147,6 +147,7 @@ jobs:
               tests/test_inkling2_autospeed_attnres.py
               tests/test_inkling2_autospeed_rawmask.py
               tests/test_inkling2_prefill_glue.py
+              tests/test_inkling2_other_builds.py
               tests/test_processors.py
               tests/test_speculative.py
               tests/test_dspark_rejection.py
