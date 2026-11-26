@@ -196,7 +196,10 @@ def _to_omlx(weights, sliding):
                     out[f"{pre}attn.{dst}.{s}"] = mx.concatenate(parts, axis=0)
 
         if idx in sliding:
-            stack("in_proj", ["q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj"])
+            stack(
+                "in_proj",
+                ["q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj"],
+            )
             for n in ("k", "v"):
                 out[pre + f"attn.{n}_conv"] = d.pop(f"{a}{n}_sconv.conv.weight")[..., 0]
             out[pre + "attn_norm.weight"] = d.pop("input_layernorm.weight")
@@ -206,7 +209,9 @@ def _to_omlx(weights, sliding):
                 stack(f"{n}_proj", [f"{n}_proj", f"{n}_sconv.weight_proj"])
                 out[pre + f"attn.{n}_static"] = d.pop(f"{a}{n}_sconv.static_weight")
             for n in ("q", "k", "v"):
-                out[pre + f"{n}_input_norm.weight"] = d.pop(f"{n}_input_layernorm.weight")
+                out[pre + f"{n}_input_norm.weight"] = d.pop(
+                    f"{n}_input_layernorm.weight"
+                )
         stack("o_proj", ["o_proj"])
         out[pre + "attn.q_scale"] = d.pop(a + "q_scale")
         out[pre + "attn.r_scale"] = d.pop(a + "rel_scale")

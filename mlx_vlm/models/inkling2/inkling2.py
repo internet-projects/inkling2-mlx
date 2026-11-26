@@ -82,7 +82,14 @@ def _infer_quantization(path, weight, scales, in_dims):
     return {"group_size": group_size, "bits": bits, "mode": mode}
 
 
-_OMLX_SLIDING_IN_PROJ = ("q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj")
+_OMLX_SLIDING_IN_PROJ = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "r_proj",
+    "gate_proj",
+    "sink_proj",
+)
 _OMLX_GLOBAL_Q_PROJ = ("q_proj", "r_proj", "gate_proj", "sink_proj")
 _OMLX_LOOP_INPUTS = ("attn", "k", "v", "mlp")
 _OMLX_VISION_RENAMES = (
@@ -261,14 +268,18 @@ class Model(nn.Module):
                 names = [a + n for n in _OMLX_SLIDING_IN_PROJ]
                 _split_rows(d, "attn.in_proj", names, [rows(n) for n in names], out)
                 for n in ("k", "v"):
-                    out[a + f"{n}_sconv.conv.weight"] = d.pop(f"attn.{n}_conv")[..., None]
+                    out[a + f"{n}_sconv.conv.weight"] = d.pop(f"attn.{n}_conv")[
+                        ..., None
+                    ]
                 out[base + "input_layernorm.weight"] = d.pop("attn_norm.weight")
             else:
                 names = [a + n for n in _OMLX_GLOBAL_Q_PROJ]
                 _split_rows(d, "attn.q_proj", names, [rows(n) for n in names], out)
                 for n in ("k", "v"):
                     names = [a + f"{n}_proj", a + f"{n}_sconv.weight_proj"]
-                    _split_rows(d, f"attn.{n}_proj", names, [rows(n) for n in names], out)
+                    _split_rows(
+                        d, f"attn.{n}_proj", names, [rows(n) for n in names], out
+                    )
                     out[a + f"{n}_sconv.static_weight"] = d.pop(f"attn.{n}_static")
                 for n in ("q", "k", "v"):
                     out[base + f"{n}_input_layernorm.weight"] = d.pop(
@@ -285,7 +296,10 @@ class Model(nn.Module):
             out[base + "post_attention_layernorm.weight"] = d.pop("mlp_norm.weight")
             out[base + "mlp.gate_weight"] = d.pop("mlp.router_weight")
             out[base + "mlp.e_score_correction_bias"] = d.pop("mlp.router_bias")
-            for src, dst in (("attn_input", "attention_input"), ("mlp_input", "mlp_input")):
+            for src, dst in (
+                ("attn_input", "attention_input"),
+                ("mlp_input", "mlp_input"),
+            ):
                 if f"{src}.query" in d:
                     target = base + f"{dst}.query"
                     out[target] = d.pop(f"{src}.query").reshape(shapes[target])
@@ -293,10 +307,16 @@ class Model(nn.Module):
             for suffix in ("weight", "scales", "biases"):
                 if f"mlp.experts.w13.{suffix}" in d:
                     g, u = _split_gate_up(d.pop(f"mlp.experts.w13.{suffix}"))
-                    out[sw + "gate_proj." + suffix], out[sw + "up_proj." + suffix] = g, u
+                    out[sw + "gate_proj." + suffix], out[sw + "up_proj." + suffix] = (
+                        g,
+                        u,
+                    )
                 if f"mlp.experts.w2.{suffix}" in d:
                     out[sw + "down_proj." + suffix] = d.pop(f"mlp.experts.w2.{suffix}")
-            for which, names in (("w13", ("gate_proj", "up_proj")), ("w2", ("down_proj",))):
+            for which, names in (
+                ("w13", ("gate_proj", "up_proj")),
+                ("w2", ("down_proj",)),
+            ):
                 gs = d.pop(f"mlp.experts.{which}.global_scale", None)
                 if gs is not None:
                     for n in names:
@@ -308,15 +328,17 @@ class Model(nn.Module):
                 width = down.shape[2]
                 for i, m in enumerate(_OMLX_LOOP_INPUTS):
                     c = base + f"controllers.{m}."
-                    out[c + "down_weight"] = down[i].transpose(2, 0, 1).reshape(
-                        down.shape[3], -1
+                    out[c + "down_weight"] = (
+                        down[i].transpose(2, 0, 1).reshape(down.shape[3], -1)
                     )
                     out[c + "gain_weight"] = gain_forget[i][:, :width].T
                     out[c + "forget_weight"] = gain_forget[i][:, width:].T
             if "loop_message.query" in d:
                 messages[idx] = d.pop("loop_message.query")
             if d:
-                raise ValueError(f"Unmapped oMLX Inkling 2 tensors in layer {idx}: {sorted(d)}")
+                raise ValueError(
+                    f"Unmapped oMLX Inkling 2 tensors in layer {idx}: {sorted(d)}"
+                )
         if messages:
             out["language_model.model.message_queries"] = mx.stack(
                 [messages[i] for i in sorted(messages)]

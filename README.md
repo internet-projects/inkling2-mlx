@@ -21,10 +21,10 @@ Published by [NetProjects](https://netprojects.com) (Internet Projects Ltd). Not
 Python 3.10 or newer on an Apple Silicon Mac:
 
 ```bash
-pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.7" torch torchvision
+pip install "git+https://github.com/internet-projects/inkling2-mlx@v0.2.8" torch torchvision
 ```
 
-This installs `mlx-vlm` version `0.8.0+inkling2mini.6`. Without the tool-call parser, stock MLX-VLM from main works too:
+This installs `mlx-vlm` version `0.8.0+inkling2mini.10`. Without the tool-call parser, stock MLX-VLM from main works too:
 `pip install "git+https://github.com/Neywa-Labs/mlx-vlm" torch torchvision`. PyTorch and torchvision are only used on the CPU by the image
 processor.
 
@@ -63,10 +63,28 @@ draft, kind = load_drafter("netprojects/Inkling-2-Mini-MLX-4-8bit")
 print(generate(model, processor, prompt, max_tokens=2048, draft_model=draft, draft_kind=kind, draft_block_size=4).text)
 ```
 
-Since v0.2.5, plain decode is fast enough that DSpark pays off mainly on text that repeats what came before (code edits,
-rewrites, structured output). For ordinary chat, plain decode is faster (see the v0.2.5 table below). Without a block size,
-DSpark now uses block 4 (it used the draft's 8, which is slower on chat).
+Since v0.2.5, plain decode is fast enough that drafting pays off mainly on text that repeats what came before (code edits,
+rewrites, structured output). Since v0.2.8, drafting switches itself off while plain decode is faster and back on when drafting
+pays again (auto-off, greedy and seeded runs). Without a block size, DSpark uses block 4.
 Server: add `--draft-model <same repo> --draft-kind dflash --draft-block-size 4`.
+
+DFlash2 draft (v0.2.8): the separate [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+draft (about 1 GB) also loads, with `load_drafter("incoai/Inkling-2-Mini-DFlash2")` or `--draft-model incoai/Inkling-2-Mini-DFlash2`.
+
+Greedy tok/s on an M5 Max, 4-bit build, block 4, 256 new tokens (plain decode 83-87):
+
+| Draft | chat | chat 2 | code | rewrite |
+|---|---|---|---|---|
+| DSpark (bundled), auto-off off | 60 | 59 | 93 | 94 |
+| DSpark (bundled), auto-off | 86 | 82 | 96 | 92 |
+| DFlash2, auto-off off | 67 | 66 | 98 | 87 |
+| DFlash2, auto-off | 85 | 82 | 90 | 94 |
+
+`MLX_VLM_DSPARK_AUTO_OFF=0` keeps drafting on for every round.
+
+Variable-loop checkpoints (v0.2.8): [thinkingmachines/TML-d24-varloop-research](https://huggingface.co/thinkingmachines/TML-d24-varloop-research)
+loads like Inkling 2 Mini and runs its looped layers 1 to 5 times. Set the pass count with `INKLING2_LOOP_PASSES=N` (or
+`loop_num_passes` in the text config); the checkpoint's default is 3. The bundled DSpark draft works only at 3 passes.
 
 Faster one-token decode (v0.2.3, on by default): the attention no longer copies its key/value history at every step.
 On an M5 Max with the 4-bit build, plain decode went from 41.0 to 44.6 tok/s at a 1K prompt and from 36.4 to 41.7 at 16K,
@@ -127,6 +145,25 @@ OpenAI-compatible server (tool calls returned as `tool_calls`, thinking as `reas
 ```bash
 mlx_vlm.server --model netprojects/Inkling-2-Mini-MLX-4-8bit --port 8000
 ```
+
+### Other Inkling 2 Mini MLX builds
+
+From v0.2.8, `load` also reads Inkling 2 Mini builds made for other runtimes: builds converted with mlx-lm's Inkling
+support (pull request #2086, for example mlx-community/Inkling-2-Mini-4bit), oMLX (oQ) builds such as
+mlx-community/Inkling-2-Mini-oQ4e-mtp, and nativ-community/Inkling-2-Mini-nvfp4. The loader renames their tensors and
+reads each layer's format (affine, NVFP4, MXFP8) from the tensor shapes, because some of their configs list only one
+format. Our DSpark draft works with them too. Same Mac, 256 new tokens, greedy, thinking off, 26 November 2026:
+
+| Build | Chat tok/s (plain / DSpark) | Code tok/s (plain / DSpark) | Same first token as our 4-bit |
+|---|---|---|---|
+| netprojects/Inkling-2-Mini-MLX-4bit | 87 / 60 | 87 / 93 | (reference) |
+| mlx-community/Inkling-2-Mini-oQ3e-mtp | 83 / 53 | 83 / 95 | 84% |
+| mlx-community/Inkling-2-Mini-4bit | 71 / 42 | 70 / 61 | 92% |
+| mlx-community/Inkling-2-Mini-oQ4e-mtp | 67 / 36 | 64 / 53 | 92% |
+| pipenetwork/Inkling-2-Mini-MLX-8bit | 65 / 39 | 64 / 57 | 92% |
+| nativ-community/Inkling-2-Mini-nvfp4 | 52 / 36 | 52 / 50 | 91% |
+
+Builds that keep the released NVFP4/MXFP8 experts are slower on the Mac than plain affine experts.
 
 ## Checks
 

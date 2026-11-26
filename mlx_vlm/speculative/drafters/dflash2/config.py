@@ -143,8 +143,7 @@ class DFlash2Config(DFlashConfig):
 
         ids = flat.get("target_layer_ids")
         if ids and (
-            "num_target_layers" not in flat
-            or max(ids) == flat["num_target_layers"]
+            "num_target_layers" not in flat or max(ids) == flat["num_target_layers"]
         ):
             # Inkling 2 Mini's draft taps loop visits; a last tap equal to the
             # visit count (as the published config writes it: 48 of 48) is the
